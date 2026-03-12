@@ -1,0 +1,12 @@
+asyncpg==0.31.0
+fastapi==0.103.1
+httpx==0.28.1
+langchain==1.2.10
+langchain-classic==1.0.2
+langchain-ollama==1.0.1
+langchain-openai==1.1.10
+loguru==0.7.3
+openai==2.24.0
+pydantic==2.12.5
+python-dotenv==1.0.0
+uvicorn==0.23.2

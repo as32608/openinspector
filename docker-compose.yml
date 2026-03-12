@@ -1,0 +1,60 @@
+version: '3.8'
+
+services:
+  postgres:
+    image: postgres:15-alpine
+    container_name: llm_obs_postgres
+    restart: unless-stopped
+    environment:
+      - POSTGRES_USER=admin
+      - POSTGRES_PASSWORD=postgrespw
+      - POSTGRES_DB=tracing_db
+    ports:
+      - "5432:5432"
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U admin -d tracing_db"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  proxy:
+    build: ./proxy
+    container_name: llm_obs_proxy
+    restart: unless-stopped
+    ports:
+      - "${PROXY_PORT:-8080}:8080"
+    env_file: .env
+    environment:
+      - DATABASE_URL=postgresql://admin:postgrespw@postgres:5432/tracing_db
+    depends_on:
+      postgres:
+        condition: service_healthy
+    command: uvicorn main:app --host 0.0.0.0 --port 8080
+
+  dashboard-api:
+    build: ./dashboard_api
+    container_name: llm_obs_api
+    restart: unless-stopped
+    ports:
+      - "8081:8081"
+    env_file: .env
+    environment:
+      - DATABASE_URL=postgresql://admin:postgrespw@postgres:5432/tracing_db
+    depends_on:
+      postgres:
+        condition: service_healthy
+    command: uvicorn dashboard_api:app --host 0.0.0.0 --port 8081
+
+  ui:
+    build: ./ui
+    container_name: llm_obs_ui
+    restart: unless-stopped
+    ports:
+      - "5173:80"
+    depends_on:
+      - dashboard-api
+
+volumes:
+  pg_data:
