@@ -53,13 +53,16 @@ chmod +x open-inspector.sh
 
 To use the proxy, you do not need to install any new packages. Simply point your existing AI application to the proxy port (8080 by default).
 
-**Example using the OpenAI Python SDK:**
+**Example using the OpenAI Python SDK with OpenRouter (OpenAI Compatible API):**
 ```python
 from openai import OpenAI
 
+base_url = "http://localhost:8080", # While in ".env" file, BASE_URL = https://openrouter.ai/api/v1
+api_key = "your-actual-api-key"
+
 client = OpenAI(
-    base_url="http://localhost:8080", # Point to the proxy
-    api_key="your-actual-api-key"     # Forwarded securely to the destination
+    base_url=base_url
+    api_key=api_key    # Forwarded securely to the destination
 )
 
 response = client.chat.completions.create(
@@ -67,6 +70,32 @@ response = client.chat.completions.create(
     messages=[{"role": "user", "content": "Hello!"}]
 )
 ```
+
+**Example using the OpenAI Python SDK with Ollama:**
+```python
+from openai import OpenAI
+
+base_url = "http://localhost:8080/v1", # While in ".env" file, BASE_URL=http://host.docker.internal:11434
+# Or
+# base_url = "http://localhost:8080", # While in ".env" file, BASE_URL=http://host.docker.internal:11434/v1
+
+api_key = "dummy_key_does_not_matter_for_ollama"
+
+client = OpenAI(
+    base_url=base_url
+    api_key=api_key    # Forwarded securely to the destination
+)
+
+response = client.chat.completions.create(
+    model="qwen3.5:9b",
+    messages=[{"role": "user", "content": "Hello!"}]
+)
+```
+
+**Note:**
+- OpenAI SDK expects the base_url to be ending with version, example "/v1" while Langchain usually expects one that doesn't end with version. So adjust either the BASE_URL in the `.env` or base_url in the code accordingly.
+- After making any change to .env file, restart the service `./open-inspector.sh stop` and `./open-inspector.sh start`
+ 
 
 ## 💻 The CLI Tool (`open-inspector.sh`)
 Manage your environment effortlessly using the bundled CLI:

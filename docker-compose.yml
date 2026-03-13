@@ -28,6 +28,8 @@ services:
     env_file: .env
     environment:
       - DATABASE_URL=postgresql://admin:postgrespw@postgres:5432/tracing_db
+    extra_hosts:
+      - "host.docker.internal:host-gateway" # For the Linux localhost issue
     depends_on:
       postgres:
         condition: service_healthy
