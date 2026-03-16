@@ -82,6 +82,66 @@ export default function App() {
     return <pre className="whitespace-pre-wrap text-xs text-gray-400">{raw}</pre>;
   };
 
+  // Robust helper to format tool arguments whether they are strings or objects
+  const renderArgs = (args: any) => {
+    if (!args) return "";
+    if (typeof args === 'string') {
+      try {
+        // Handle double-stringified JSON commonly found in older OpenAI SDK logs
+        return JSON.stringify(JSON.parse(args));
+      } catch {
+        return args;
+      }
+    }
+    return JSON.stringify(args);
+  };
+
+  // Recursive helper to handle Anthropic's Array of Content Blocks vs OpenAI's Strings
+  const renderMessageContent = (content: any) => {
+    if (!content) return null;
+    
+    if (typeof content === 'string') {
+      return <div className="whitespace-pre-wrap">{content}</div>;
+    }
+
+    if (Array.isArray(content)) {
+      return (
+        <div className="space-y-2">
+          {content.map((block: any, i: number) => {
+            if (block.type === 'text') {
+              return <div key={i} className="whitespace-pre-wrap">{block.text}</div>;
+            }
+            if (block.type === 'thinking') {
+              return (
+                <div key={i} className="text-xs bg-yellow-50 p-2 rounded border border-yellow-100 italic text-yellow-800">
+                  <span className="font-bold uppercase block mb-1">Thinking Block</span>
+                  {block.thinking}
+                </div>
+              );
+            }
+            if (block.type === 'tool_use') {
+              return (
+                <div key={i} className="text-xs font-mono bg-purple-100/50 p-2 rounded text-purple-800">
+                  <Wrench className="w-3 h-3 inline mr-1"/> Action: {block.name}
+                </div>
+              );
+            }
+            if (block.type === 'tool_result') {
+               return (
+                 <div key={i} className="text-xs font-mono bg-orange-50 p-2 rounded text-orange-800">
+                    <CornerDownRight className="w-3 h-3 inline mr-1"/> Tool Result: {renderMessageContent(block.content)}
+                 </div>
+               );
+            }
+            return null;
+          })}
+        </div>
+      );
+    }
+    return <pre className="text-xs whitespace-pre-wrap opacity-70">{JSON.stringify(content, null, 2)}</pre>;
+  };
+
+
   return (
     <div className="min-h-screen bg-gray-50 text-gray-900 font-sans p-8 w-full flex justify-center">
       
@@ -290,8 +350,8 @@ export default function App() {
                               {msg.tool_call_id && <span>ID: {msg.tool_call_id}</span>}
                             </div>
                             
-                            {/* Message Content */}
-                            <div>{msg.content}</div>
+                            {/* Uses new helper to render Anthropic blocks or OpenAI strings seamlessly */}
+                            <div>{renderMessageContent(msg.content)}</div>
 
                             {/* Historical Tool Calls triggered by Assistant */}
                             {msg.role === 'assistant' && msg.tool_calls && msg.tool_calls.length > 0 && (
@@ -299,11 +359,11 @@ export default function App() {
                                 <span className="text-xs uppercase font-bold text-purple-600 opacity-70">Triggered Tools:</span>
                                 {msg.tool_calls.map((tc:any, tIdx:number) => {
                                   const tcName = tc.function?.name || tc.name;
-                                  const tcArgs = typeof tc.function?.arguments === 'string' ? tc.function.arguments : JSON.stringify(tc.function?.arguments || tc.arguments);
                                   return (
                                     <div key={tIdx} className="bg-white/60 p-2 rounded border border-gray-200 text-xs font-mono shadow-sm">
                                       <span className="font-bold text-purple-700">{tcName}</span>
-                                      <span className="text-gray-600">({tcArgs})</span>
+                                      {/* Uses new renderArgs to safely print JSON objects or strings */}
+                                      <span className="text-gray-600">({renderArgs(tc.function?.arguments || tc.arguments)})</span>
                                     </div>
                                   )
                                 })}
@@ -319,9 +379,11 @@ export default function App() {
                           <h3 className="font-semibold text-gray-700 flex items-center text-sm uppercase tracking-wide"><Terminal className="w-4 h-4 mr-2"/> Provided Tools</h3>
                           <div className="space-y-3">
                              {traceData.clicked_log.parsed_req.tools.map((t:any, i:number) => {
-                               const toolName = t.function?.name || t.name;
-                               const props = t.function?.parameters?.properties || {};
-                               const reqArgs = t.function?.parameters?.required || [];
+                               // Fallback logic to handle both OpenAI and Anthropic tool schemas
+                               const toolName = t.function?.name || t.name || "Unknown Tool";
+                               const toolDesc = t.function?.description || t.description || "No description provided.";
+                               const props = t.function?.parameters?.properties || t.input_schema?.properties || {};
+                               const reqArgs = t.function?.parameters?.required || t.input_schema?.required || [];
                                
                                return (
                                  <div key={i} className="flex flex-col bg-white border border-purple-100 rounded-md shadow-sm overflow-hidden">
@@ -330,23 +392,31 @@ export default function App() {
                                    </div>
                                    
                                    <div className="p-4 text-xs text-gray-700">
-                                     <p className="italic text-gray-500 mb-3">{t.function?.description || "No description provided."}</p>
+                                     <p className="italic text-gray-600 mb-4 whitespace-pre-wrap">{toolDesc}</p>
                                      
                                      {Object.keys(props).length > 0 ? (
                                        <table className="w-full text-left border-collapse">
                                          <thead>
                                            <tr className="border-b border-gray-200">
-                                             <th className="pb-2 font-semibold text-gray-600 w-1/3">Argument</th>
-                                             <th className="pb-2 font-semibold text-gray-600 w-1/3">Type</th>
-                                             <th className="pb-2 font-semibold text-gray-600 w-1/3">Req.</th>
+                                             <th className="pb-2 font-semibold text-gray-600 w-1/5">Argument</th>
+                                             <th className="pb-2 font-semibold text-gray-600 w-1/5">Type</th>
+                                             <th className="pb-2 font-semibold text-gray-600 w-1/12">Req.</th>
+                                             <th className="pb-2 font-semibold text-gray-600">Description</th>
                                            </tr>
                                          </thead>
                                          <tbody>
                                            {Object.entries(props).map(([argName, argData]: any) => (
-                                             <tr key={argName} className="border-b border-gray-100 last:border-0">
-                                               <td className="py-2 font-mono text-blue-600">{argName}</td>
-                                               <td className="py-2 text-gray-500">{argData.type || (argData.anyOf ? 'anyOf' : 'any')}</td>
-                                               <td className="py-2">{reqArgs.includes(argName) ? <span className="text-red-500 font-bold">Yes</span> : 'No'}</td>
+                                             <tr key={argName} className="border-b border-gray-100 last:border-0 align-top">
+                                               <td className="py-2 font-mono text-blue-600 pr-2">{argName}</td>
+                                               <td className="py-2 text-gray-500 pr-2">
+                                                 {argData.type || (argData.anyOf ? 'anyOf' : (argData.enum ? 'enum' : 'any'))}
+                                               </td>
+                                               <td className="py-2 pr-2">
+                                                 {reqArgs.includes(argName) ? <span className="text-red-500 font-bold">Yes</span> : 'No'}
+                                               </td>
+                                               <td className="py-2 text-gray-500 opacity-80 break-words pr-2">
+                                                 {argData.description || "-"}
+                                               </td>
                                              </tr>
                                            ))}
                                          </tbody>
@@ -417,17 +487,19 @@ export default function App() {
                                        return (
                                          <div key={i} className="font-mono text-xs bg-white rounded border border-purple-100 mb-3 last:mb-0 shadow-sm overflow-hidden">
                                            <div className="p-3">
-                                             <span className="font-bold text-purple-700">{tc.name}</span>({JSON.stringify(tc.arguments)})
+                                             <span className="font-bold text-purple-700">{tc.name}</span>
+                                             {/* Fixed argument rendering here */}
+                                             ({renderArgs(tc.arguments)})
                                              <div className="text-gray-400 mt-1 text-[10px]">ID: {tc.id}</div>
                                            </div>
                                            
-                                           {/* Display the tool result directly under the invocation if found */}
                                            {toolResultMsg && (
                                               <div className="bg-orange-50/80 border-t border-purple-50 p-3 text-orange-900 flex items-start">
                                                 <CornerDownRight className="w-3 h-3 mr-2 mt-0.5 text-orange-400 flex-shrink-0" />
                                                 <div>
                                                   <span className="font-bold text-[10px] uppercase text-orange-600 block mb-1">Tool Result</span>
-                                                  <span className="whitespace-pre-wrap font-sans text-sm">{toolResultMsg.content}</span>
+                                                  {/* Fixed content block parsing here */}
+                                                  <div className="whitespace-pre-wrap font-sans text-sm">{renderMessageContent(toolResultMsg.content)}</div>
                                                 </div>
                                               </div>
                                            )}

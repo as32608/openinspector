@@ -69,6 +69,9 @@ async def lifespan(app: FastAPI):
                         created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
                     )
                 ''')
+                # Create GIN indexes for fast JSON searching
+                await conn.execute('CREATE INDEX IF NOT EXISTS idx_logs_body ON api_logs USING GIN (request_body_json)')
+                await conn.execute('CREATE INDEX IF NOT EXISTS idx_logs_tools ON api_logs USING GIN (tool_calls)')
             logger.info("Database and Schema ready.")
         except Exception as e:
             logger.error(f"DB Connection Error: {e}")
@@ -82,7 +85,7 @@ async def lifespan(app: FastAPI):
     if client:
         await client.aclose()  # Clean up the HTTP client
 
-app = FastAPI(title="Ollama/OpenRouter Proxy", lifespan=lifespan)
+app = FastAPI(title="OpenInspector Proxy", lifespan=lifespan)
 
 
 def normalize_tool_calls(raw_calls):
@@ -123,73 +126,79 @@ def normalize_tool_calls(raw_calls):
 
 async def process_log(log: dict):
     already_logged = log.get('logged', False)
-    if log.get("response") and log.get("request") and db_pool and (
-            not already_logged):
-        logger.info(
-            "Complete Input/Output captured. Processing for DB insertion...")
+    if not (log.get("response") and log.get("request") and db_pool and (
+            not already_logged)):
+        return
 
-        req = log["request"]
-        res = log["response"]
-        resp_data = res.get("response", {})
+    req = log["request"]
+    res = log["response"]
+    resp_data = res.get("response", {})
 
-        # 1. Extract Text and Reasoning
-        final_text = resp_data.get("final_text", "")
-        final_reasoning = resp_data.get("final_reasoning_text", "")
+    # Provider-Agnostic Content Extraction
+    final_text = resp_data.get("final_text", "")
+    final_reasoning = resp_data.get("final_reasoning_text", "")
 
-        # Standardize Tool Calls before DB insertion
-        raw_tool_calls = resp_data.get("tool_calls", [])
-        if not raw_tool_calls and "choices" in resp_data and len(
-                resp_data["choices"]) > 0:
-            msg = resp_data["choices"][0].get("message", {})
-            raw_tool_calls = msg.get("tool_calls") or []
-            final_text = msg.get("content") or final_text
-            final_reasoning = msg.get("reasoning") or final_reasoning
+    # Standardize Tool Calls before DB insertion
+    raw_tools = resp_data.get("tool_calls", [])
 
-        tool_calls = normalize_tool_calls(raw_tool_calls)
+    # Handle Non-Streaming OpenAI/Anthropic structures
+    if not final_text and "choices" in resp_data:  # OpenAI
+        msg = resp_data["choices"][0].get("message", {})
+        final_text = msg.get("content") or ""
+        final_reasoning = msg.get("reasoning") or ""
+        raw_tools = msg.get("tool_calls") or []
+    elif not final_text and "content" in resp_data:  # Anthropic Non-Stream
+        for block in resp_data["content"]:
+            if block.get("type") == "text":
+                final_text += block.get("text", "")
+            if block.get("type") == "thinking":
+                final_reasoning += block.get("thinking", "")
+            if block.get("type") == "tool_use":
+                raw_tools.append(block)
 
-        try:
-            async with db_pool.acquire() as conn:
-                await conn.execute(
-                    '''
-                    INSERT INTO api_logs (
-                        url,
-                        method,
-                        query_params,
-                        request_headers,
-                        request_content_type,
-                        request_body_raw,
-                        request_body_json,
-                        response_status_code,
-                        response_headers,
-                        response_content_type,
-                        response_body_raw,
-                        response_body_json,
-                        final_text,
-                        final_reasoning_text,
-                        tool_calls,
-                        duration_sec
-                    ) VALUES ($1, $2, $3::jsonb, $4::jsonb, $5, $6, $7::jsonb, $8, $9::jsonb, $10, $11, $12::jsonb, $13, $14, $15::jsonb, $16)
-                    ''',
-                    str(req.get("url")),
-                    req.get("method"),
-                    json.dumps(req.get("query_params")),
-                    json.dumps(req.get("headers")),
-                    req.get("headers", {}).get("content-type"),
-                    req.get("raw_body"),
-                    json.dumps(req.get("body")),
-                    res.get("status_code"),
-                    json.dumps(res.get("headers")),
-                    res.get("content_type"),
-                    res.get("raw_response"),
-                    json.dumps(resp_data),
+    try:
+        async with db_pool.acquire() as conn:
+            await conn.execute(
+                '''
+                INSERT INTO api_logs (
+                    url,
+                    method,
+                    query_params,
+                    request_headers,
+                    request_content_type,
+                    request_body_raw,
+                    request_body_json,
+                    response_status_code,
+                    response_headers,
+                    response_content_type,
+                    response_body_raw,
+                    response_body_json,
                     final_text,
-                    final_reasoning,
-                    json.dumps(tool_calls),
-                    res.get("duration_sec")
-                )
-            log['logged'] = True
-        except Exception as e:
-            logger.error(f"Postgres Insert Failed: {e}")
+                    final_reasoning_text,
+                    tool_calls,
+                    duration_sec
+                ) VALUES ($1, $2, $3::jsonb, $4::jsonb, $5, $6, $7::jsonb, $8, $9::jsonb, $10, $11, $12::jsonb, $13, $14, $15::jsonb, $16)
+                ''',
+                str(req.get("url")),
+                req.get("method"),
+                json.dumps(req.get("query_params")),
+                json.dumps(req.get("headers")),
+                req.get("headers", {}).get("content-type"),
+                req.get("raw_body"),
+                json.dumps(req.get("body")),
+                res.get("status_code"),
+                json.dumps(res.get("headers")),
+                res.get("content_type"),
+                res.get("raw_response"),
+                json.dumps(resp_data),
+                final_text,
+                final_reasoning,
+                json.dumps(normalize_tool_calls(raw_tools)),
+                res.get("duration_sec")
+            )
+        log['logged'] = True
+    except Exception as e:
+        logger.error(f"Postgres Insert Failed: {e}")
 
 
 async def log_request_details(request: Request, body: bytes, store: dict):
@@ -236,18 +245,32 @@ async def stream_ollama_response(
                 continue
 
             # Remove "data: " prefix for SSE, or use raw line for NDJSON
-            json_str = line
-            if not is_ndjson:
-                match = pat_text_stream.match(line)
-                if not match:
-                    continue
-                json_str = match.group(1)
-
+            json_str = line[6:] if line.startswith('data: ') else line
             try:
                 data = json.loads(json_str)
-
+                # 1. Anthropic Stream
+                if data.get("type") == "content_block_delta":
+                    delta = data.get("delta", {})
+                    if delta.get("type") == "text_delta":
+                        content_acc.append(delta.get("text", ""))
+                    elif delta.get("type") == "thinking_delta":
+                        reasoning_acc.append(delta.get("thinking", ""))
+                    elif delta.get("type") == "input_json_delta":
+                        idx = data.get("index", 0)
+                        if idx not in tool_call_map:
+                            tool_call_map[idx] = {
+                                "id": None, "name": "", "arguments": ""}
+                        tool_call_map[idx]["arguments"] += delta.get(
+                            "partial_json", "")
+                elif data.get("type") == "content_block_start":
+                    block = data.get("content_block", {})
+                    if block.get("type") == "tool_use":
+                        idx = data.get("index", 0)
+                        tool_call_map[idx] = {
+                            "id": block.get("id"),
+                            "name": block.get("name"), "arguments": ""}
                 # --- Handle Ollama Native Format ---
-                if is_ndjson:
+                elif data.get("message"):
                     msg = data.get("message", {})
                     if msg.get("content"):
                         content_acc.append(msg["content"])
