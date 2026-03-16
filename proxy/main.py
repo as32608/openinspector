@@ -147,7 +147,8 @@ async def process_log(log: dict):
         final_text = msg.get("content") or ""
         final_reasoning = msg.get("reasoning") or ""
         raw_tools = msg.get("tool_calls") or []
-    elif not final_text and "content" in resp_data:  # Anthropic Non-Stream
+    elif not final_text and "content" in resp_data and isinstance(
+            resp_data["content"], list):  # Anthropic Non-Stream
         for block in resp_data["content"]:
             if block.get("type") == "text":
                 final_text += block.get("text", "")
@@ -244,18 +245,24 @@ async def stream_ollama_response(
             if not line or line.startswith(':') or line == 'data: [DONE]':
                 continue
 
-            # Remove "data: " prefix for SSE, or use raw line for NDJSON
-            json_str = line[6:] if line.startswith('data: ') else line
+            json_str = line
+            if not is_ndjson:
+                if line.startswith('data: '):
+                    json_str = line[6:]
+                else:
+                    continue
+
             try:
                 data = json.loads(json_str)
                 # 1. Anthropic Stream
                 if data.get("type") == "content_block_delta":
                     delta = data.get("delta", {})
-                    if delta.get("type") == "text_delta":
+                    d_type = delta.get("type")
+                    if d_type == "text_delta":
                         content_acc.append(delta.get("text", ""))
-                    elif delta.get("type") == "thinking_delta":
+                    elif d_type == "thinking_delta":
                         reasoning_acc.append(delta.get("thinking", ""))
-                    elif delta.get("type") == "input_json_delta":
+                    elif d_type == "input_json_delta":
                         idx = data.get("index", 0)
                         if idx not in tool_call_map:
                             tool_call_map[idx] = {
@@ -269,9 +276,10 @@ async def stream_ollama_response(
                         tool_call_map[idx] = {
                             "id": block.get("id"),
                             "name": block.get("name"), "arguments": ""}
-                # --- Handle Ollama Native Format ---
-                elif data.get("message"):
-                    msg = data.get("message", {})
+
+                # --- Handle Ollama Native NDJSON Format ---
+                elif is_ndjson and data.get("message"):
+                    msg = data.get("message")
                     if msg.get("content"):
                         content_acc.append(msg["content"])
 
@@ -305,7 +313,7 @@ async def stream_ollama_response(
                             tool_call_map[idx]["arguments"] += args
 
                 # --- Handle OpenAI / OpenRouter Format ---
-                else:
+                elif "choices" in data:
                     choices = data.get("choices", [])
                     if not choices:
                         continue
