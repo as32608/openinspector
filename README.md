@@ -53,7 +53,7 @@ chmod +x open-inspector.sh
 
 To use the proxy, you do not need to install any new packages. Simply point your existing AI application to the proxy port (8080 by default).
 
-**Example using the OpenAI Python SDK with OpenRouter (OpenAI Compatible API):**
+### Example using the OpenAI Python SDK with OpenRouter (OpenAI Compatible API):
 ```python
 from openai import OpenAI
 
@@ -71,7 +71,7 @@ response = client.chat.completions.create(
 )
 ```
 
-**Example using the OpenAI Python SDK with Ollama:**
+### Example using the OpenAI Python SDK with Ollama:
 ```python
 from openai import OpenAI
 
@@ -92,10 +92,55 @@ response = client.chat.completions.create(
 )
 ```
 
-**Note:**
-- OpenAI SDK expects the base_url to be ending with version, example "/v1" while Langchain usually expects one that doesn't end with version. So adjust either the BASE_URL in the `.env` or base_url in the code accordingly.
-- After making any change to .env file, restart the service `./open-inspector.sh stop` and `./open-inspector.sh start`
+> Note: OpenAI SDK expects the base_url to be ending with version, example "/v1" while Langchain usually expects one that doesn't end with version. So adjust either the BASE_URL in the `.env` or base_url in the code accordingly.
+
  
+### Usage with Claude Code
+
+- If using Claude Code with **Anthropic**, set the 'BASE_URL' in `.env` to Anthropic url
+
+  `BASE_URL=https://api.anthropic.com`
+
+  Also, set environment variables in your terminal (or global) as:
+  ```shell
+  export ANTHROPIC_BASE_URL=http://localhost:8080
+  ```
+
+- If using Claude Code with **OpenRouter**, set the `BASE_URL` in `.env` to OpenRouter API url
+  
+  `BASE_URL=https://openrouter.ai/api`
+
+  Also, set environment variables in your terminal (or global) as:
+  ```shell
+  export ANTHROPIC_AUTH_TOKEN=your_open_router_api_key
+  export ANTHROPIC_API_KEY=""
+  export ANTHROPIC_BASE_URL=http://localhost:8080
+  # Optionally set model to any model available locally
+  export ANTHROPIC_MODEL=any_open_router_model_example_arcee-ai/trinity-large-preview:free
+  ```
+
+- If using Claude Code with Local **Ollama**, set the set the `BASE_URL` in `.env` to Ollama API url
+
+  `BASE_URL=http://localhost:11434`
+
+  Also, set environment variables in your terminal (or global) as:
+  ```shell
+  export ANTHROPIC_AUTH_TOKEN=ollama
+  export ANTHROPIC_API_KEY=""
+  export ANTHROPIC_BASE_URL=http://localhost:8080
+  # Optionally set model to any model available locally
+  export ANTHROPIC_MODEL=qwen3.5:9b
+  ```
+
+> Note: - After making any change to `.env` file, restart the service `./open-inspector.sh stop` and `./open-inspector.sh start`
+
+ **Sample Trace Snippets from Claude Code execution**
+
+ ![Claude sample trace part 1](resources/claude_ex_1.png)
+ > . . . Only 2 screenshots included for reference (complete trace has more info)
+
+ ![Claude sample trace part 1](resources/claude_ex_2.png)
+
 
 ## 💻 The CLI Tool (`open-inspector.sh`)
 Manage your environment effortlessly using the bundled CLI:
