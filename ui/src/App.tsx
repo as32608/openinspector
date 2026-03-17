@@ -113,7 +113,7 @@ export default function App() {
             }
             if (block.type === 'thinking') {
               return (
-                <div key={i} className="text-xs bg-yellow-50 p-2 rounded border border-yellow-100 italic text-yellow-800">
+                <div key={i} className="text-xs bg-yellow-50 p-2 rounded border border-yellow-100 italic text-yellow-800 shadow-sm">
                   <span className="font-bold uppercase block mb-1">Thinking Block</span>
                   {block.thinking}
                 </div>
@@ -121,25 +121,18 @@ export default function App() {
             }
             if (block.type === 'tool_use') {
               return (
-                // <div key={i} className="text-xs font-mono bg-purple-100/50 p-2 rounded text-purple-800">
-                //   <Wrench className="w-3 h-3 inline mr-1"/> Action: {block.name}
-                // </div>
-                <div key={i} className="mt-3 space-y-2">
-                  <span className="text-xs uppercase font-bold text-purple-600 opacity-70">Triggered Tools:</span>
-                      <div className="bg-white/60 p-2 rounded border border-gray-200 text-xs font-mono shadow-sm">
-                        <span className="font-bold text-purple-700">{block.name}</span>
-                        <span className="text-gray-600">({renderArgs(block.input)})</span>
-                      </div>
+                <div key={i} className="mt-3 space-y-1">
+                  <span className="text-[10px] uppercase font-bold text-purple-600 opacity-70">Action Invoked:</span>
+                  <div className="bg-white/60 p-2 rounded border border-gray-200 text-xs font-mono shadow-sm">
+                    <span className="font-bold text-purple-700">{block.name}</span>
+                    <span className="text-gray-600">({renderArgs(block.input)})</span>
+                  </div>
                 </div>
-                  
               );
             }
             if (block.type === 'tool_result') {
                return (
-                //  <div key={i} className="text-xs font-mono bg-orange-50 p-2 rounded text-orange-800">
-                //     <CornerDownRight className="w-3 h-3 inline mr-1"/> Tool Result: {renderMessageContent(block.content)}
-                //  </div>
-                 <div key={i} className="text-xs font-mono bg-orange-50 p-2 rounded text-orange-800">
+                 <div key={i} className="text-xs font-mono bg-orange-50 p-3 rounded border border-orange-100 text-orange-900 shadow-sm">
                     {renderMessageContent(block.content)}
                  </div>
                );
@@ -483,19 +476,26 @@ export default function App() {
                     <div className="space-y-6 pt-2">
                       <h3 className="font-semibold text-gray-700 flex items-center text-sm uppercase tracking-wide mb-6">
                         <BrainCircuit className="w-4 h-4 mr-2"/> 
-                        {viewMode === 'plain' ? 'Current Step Execution' : 'Full Agent Timeline'}
+                        {viewMode === 'plain' ? 'Current Step Execution' : 'Execution Timeline'}
                       </h3>
                       
                       {(() => {
-                        // Deduplication Logic:
-                        // In "Plain" view, ONLY show the clicked step to avoid repeating history shown above.
+                        // Find where the clicked log sits in the bidirectional chain
                         const clickedIndex = traceData.chain.findIndex((s: any) => s.id === traceData.clicked_log_id);
+                        
+                        // Deduplication Logic:
+                        // In "Plain" view, ONLY show the exact clicked step.
+                        // In "Trace" view, show the clicked step AND its forward children.
+                        // This prevents repeating history that is already visible in the Conversation Context!
                         const displayChain = viewMode === 'plain' 
-                          ? [traceData.chain[clickedIndex]] // Just the 1 step
-                          : traceData.chain;                // The full sequence
+                          ? [traceData.chain[clickedIndex]] 
+                          : traceData.chain.slice(clickedIndex);
+
+                        if (displayChain.length === 0 || !displayChain[0]) return null;
 
                         return displayChain.map((step: any, index: number) => {
                           const hasFinalText = !!step.final_text || (!step.parsed_tools?.length && !!step.response_body_raw);
+                          // Keep step numbering relative to the displayed sequence
                           const stepLabel = viewMode === 'plain' ? 'Execution' : `Step ${index + 1}`;
                           
                           return (
@@ -508,7 +508,7 @@ export default function App() {
                                 <span className="ml-3 font-mono text-xs text-gray-500 bg-gray-200 px-2 py-0.5 rounded shadow-sm">{step.duration_sec?.toFixed(2)}s</span>
                                 
                                 {step.id === traceData.clicked_log_id && viewMode === 'trace' && (
-                                  <span className="ml-3 font-semibold text-xs text-blue-700 bg-blue-100 px-2 py-0.5 rounded shadow-sm border border-blue-200">Current View</span>
+                                  <span className="ml-3 font-semibold text-xs text-blue-700 bg-blue-100 px-2 py-0.5 rounded shadow-sm border border-blue-200">Trace Start</span>
                                 )}
                               </h4>
                               
@@ -526,8 +526,8 @@ export default function App() {
                                   <div className="bg-purple-50/50 border border-purple-100 p-4 rounded-lg text-sm shadow-sm">
                                      <div className="font-bold text-xs uppercase mb-2 opacity-60 text-purple-900">Tool Calls Invoked</div>
                                      {step.parsed_tools.map((tc:any, i:number) => {
-                                       // Look ahead in the full traceData.chain (not just displayChain) for results
-                                       // To find the actual traceData index of this step:
+                                       // Look ahead in the FULL traceData.chain to grab the result,
+                                       // calculating the true absolute index to avoid offset errors
                                        const actualIndex = traceData.chain.findIndex((s:any) => s.id === step.id);
                                        const nextStep = traceData.chain[actualIndex + 1];
                                        
