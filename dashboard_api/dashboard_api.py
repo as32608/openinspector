@@ -1,6 +1,9 @@
 import os
+import asyncio
 import json
-from fastapi import FastAPI, HTTPException, Query
+import time
+import loguru
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import PlainTextResponse
 import asyncpg
@@ -12,16 +15,40 @@ try:
 except ImportError:
     pass
 
-
+MAX_WAIT_SECONDS = 120
+RETRY_INTERVAL = 3  # seconds
 DATABASE_URL = os.getenv("DATABASE_URL")
 db_pool = None
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global db_pool
-    db_pool = await asyncpg.create_pool(DATABASE_URL)
+
+    start_time = time.monotonic()
+
+    while True:
+        try:
+            db_pool = await asyncpg.create_pool(DATABASE_URL)
+            loguru.logger.info("✅ Connected to database")
+            break
+        except Exception as e:
+            elapsed = time.monotonic() - start_time
+
+            if elapsed > MAX_WAIT_SECONDS:
+                loguru.logger.error(
+                    "❌ Could not connect to database after 2 minutes")
+                raise e
+
+            loguru.logger.warning(
+                f"⏳ DB not ready yet, retrying in {RETRY_INTERVAL}s...")
+            await asyncio.sleep(RETRY_INTERVAL)
+
     yield
+
     await db_pool.close()
+    loguru.logger.info("🔌 Database pool closed")
+
 
 app = FastAPI(title="Open Inspector API", lifespan=lifespan)
 
