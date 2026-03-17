@@ -136,11 +136,18 @@ response = client.chat.completions.create(
 
  **Sample Trace Snippets from Claude Code execution**
 
- ![Claude sample trace part 1](resources/claude_ex_1.png)
- > . . . Only 2 screenshots included for reference (complete trace has more info)
+<table>
+  <tr>
+    <td><img src="resources/claude_ex_1.png" width="100%"/></td>
+    <td><img src="resources/claude_ex_2.png" width="100%"/></td>
+  </tr>
+  <tr>
+    <td><img src="resources/claude_ex_3.png" width="100%"/></td>
+    <td><img src="resources/claude_ex_4.png" width="100%"/></td>
+  </tr>
+</table>
 
- ![Claude sample trace part 1](resources/claude_ex_2.png)
-
+> . . . Only few screenshots included for reference (complete trace has more info)
 
 ## 💻 The CLI Tool (`open-inspector.sh`)
 Manage your environment effortlessly using the bundled CLI:
