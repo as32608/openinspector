@@ -348,39 +348,64 @@ export default function App() {
                       {/* Conversation History (Pulled from the CLICKED log to maintain context accuracy) */}
                       <div className="space-y-3">
                         <h3 className="font-semibold text-gray-700 flex items-center text-sm uppercase tracking-wide"><MessageSquare className="w-4 h-4 mr-2"/> Conversation Context</h3>
-                        {traceData.clicked_log?.parsed_req?.messages?.map((msg: any, idx: number) => (
-                          <div key={idx} className={`p-4 rounded-lg text-sm border ${
-                            msg.role === 'system' ? 'bg-gray-100 border-gray-200 text-gray-700' : 
-                            msg.role === 'user' ? 'bg-blue-50 border-blue-100 text-blue-900' : 
-                            msg.role === 'tool' ? 'bg-orange-50 border-orange-100 text-orange-900 font-mono' :
-                            'bg-white border-gray-200 text-gray-800'
-                          }`}>
-                            <div className="font-bold text-xs opacity-50 uppercase mb-1 flex justify-between">
-                              <span>{msg.role === 'tool' ? 'TOOL RESPONSE' : msg.role}</span>
-                              {msg.tool_call_id && <span>ID: {msg.tool_call_id}</span>}
-                            </div>
-                            
-                            {/* Uses new helper to render Anthropic blocks or OpenAI strings seamlessly */}
-                            <div>{renderMessageContent(msg.content)}</div>
-
-                            {/* Historical Tool Calls triggered by Assistant */}
-                            {msg.role === 'assistant' && msg.tool_calls && msg.tool_calls.length > 0 && (
-                              <div className="mt-3 space-y-2">
-                                <span className="text-xs uppercase font-bold text-purple-600 opacity-70">Triggered Tools:</span>
-                                {msg.tool_calls.map((tc:any, tIdx:number) => {
-                                  const tcName = tc.function?.name || tc.name;
-                                  return (
-                                    <div key={tIdx} className="bg-white/60 p-2 rounded border border-gray-200 text-xs font-mono shadow-sm">
-                                      <span className="font-bold text-purple-700">{tcName}</span>
-                                      {/* Uses new renderArgs to safely print JSON objects or strings */}
-                                      <span className="text-gray-600">({renderArgs(tc.function?.arguments || tc.arguments)})</span>
-                                    </div>
-                                  )
-                                })}
-                              </div>
-                            )}
+                        
+                        {/* Handle Anthropic System Prompt (Top-level array) */}
+                        {traceData.clicked_log?.parsed_req?.system && (
+                          <div className="p-4 rounded-lg text-sm border bg-gray-100 border-gray-200 text-gray-700 shadow-sm">
+                            <div className="font-bold text-xs opacity-50 uppercase mb-2">System Prompt</div>
+                            <div>{renderMessageContent(traceData.clicked_log.parsed_req.system)}</div>
                           </div>
-                        ))}
+                        )}
+
+                        {traceData.clicked_log?.parsed_req?.messages?.map((msg: any, idx: number) => {
+                          // Detect Anthropic's tool_result blocks hidden inside user messages
+                          let effectiveRole = msg.role;
+                          // let isAnthropicToolResult = false;
+                          let anthropicToolId = null;
+                          
+                          if (msg.role === 'user' && Array.isArray(msg.content)) {
+                            const resultBlock = msg.content.find((b: any) => b.type === 'tool_result');
+                            if (resultBlock) {
+                              effectiveRole = 'tool';
+                              // isAnthropicToolResult = true;
+                              anthropicToolId = resultBlock.tool_use_id;
+                            }
+                          }
+
+                          return (
+                            <div key={idx} className={`p-4 rounded-lg text-sm border shadow-sm ${
+                              effectiveRole === 'system' ? 'bg-gray-100 border-gray-200 text-gray-700' : 
+                              effectiveRole === 'user' ? 'bg-blue-50 border-blue-100 text-blue-900' : 
+                              effectiveRole === 'tool' ? 'bg-orange-50 border-orange-100 text-orange-900 font-mono' :
+                              'bg-white border-gray-200 text-gray-800'
+                            }`}>
+                              <div className="font-bold text-xs opacity-50 uppercase mb-2 flex justify-between">
+                                <span>{effectiveRole === 'tool' ? 'TOOL RESPONSE' : effectiveRole}</span>
+                                {msg.tool_call_id && <span>ID: {msg.tool_call_id}</span>}
+                                {anthropicToolId && <span>ID: {anthropicToolId}</span>}
+                              </div>
+                              
+                              {/* Renders text, Anthropic tool_uses, and Anthropic tool_results beautifully */}
+                              <div>{renderMessageContent(msg.content)}</div>
+
+                              {/* Historical Tool Calls triggered by Assistant (OpenAI specific schema) */}
+                              {msg.role === 'assistant' && msg.tool_calls && msg.tool_calls.length > 0 && (
+                                <div className="mt-3 space-y-2">
+                                  <span className="text-xs uppercase font-bold text-purple-600 opacity-70">Triggered Tools:</span>
+                                  {msg.tool_calls.map((tc:any, tIdx:number) => {
+                                    const tcName = tc.function?.name || tc.name;
+                                    return (
+                                      <div key={tIdx} className="bg-white/60 p-2 rounded border border-gray-200 text-xs font-mono shadow-sm">
+                                        <span className="font-bold text-purple-700">{tcName}</span>
+                                        <span className="text-gray-600">({renderArgs(tc.function?.arguments || tc.arguments)})</span>
+                                      </div>
+                                    )
+                                  })}
+                                </div>
+                              )}
+                            </div>
+                          );
+                        })}
                       </div>
 
                       {/* Provided Tools (Pulled from the CLICKED log, always expanded) */}
@@ -447,30 +472,31 @@ export default function App() {
                     <div className="space-y-6 pt-2">
                       <h3 className="font-semibold text-gray-700 flex items-center text-sm uppercase tracking-wide mb-6">
                         <BrainCircuit className="w-4 h-4 mr-2"/> 
-                        {viewMode === 'plain' ? 'Agent Execution Timeline (Up to current step)' : 'Full Agent Timeline'}
+                        {viewMode === 'plain' ? 'Current Step Execution' : 'Full Agent Timeline'}
                       </h3>
                       
                       {(() => {
-                        // Truncate the chain array if we are in "Plain" view
+                        // Deduplication Logic:
+                        // In "Plain" view, ONLY show the clicked step to avoid repeating history shown above.
                         const clickedIndex = traceData.chain.findIndex((s: any) => s.id === traceData.clicked_log_id);
-                        const displayChain = viewMode === 'plain' ? traceData.chain.slice(0, clickedIndex + 1) : traceData.chain;
+                        const displayChain = viewMode === 'plain' 
+                          ? [traceData.chain[clickedIndex]] // Just the 1 step
+                          : traceData.chain;                // The full sequence
 
                         return displayChain.map((step: any, index: number) => {
-                          // Logic to hide empty final text box if it's purely a tool execution step
                           const hasFinalText = !!step.final_text || (!step.parsed_tools?.length && !!step.response_body_raw);
+                          const stepLabel = viewMode === 'plain' ? 'Execution' : `Step ${index + 1}`;
                           
                           return (
                             <div key={step.id} className="relative pl-6 border-l-2 border-blue-200 mb-8 last:mb-0">
-                              {/* Timeline dot */}
                               <div className={`absolute -left-[9px] top-0 w-4 h-4 rounded-full border-4 border-slate-50 ${step.id === traceData.clicked_log_id ? 'bg-blue-600' : 'bg-blue-300'}`}></div>
                               
                               <h4 className="font-bold text-gray-700 mb-4 flex items-center">
-                                Step {index + 1} 
+                                {stepLabel}
                                 <span className="ml-3 font-mono text-xs text-gray-500 bg-gray-200 px-2 py-0.5 rounded shadow-sm">Log ID: {step.id}</span>
                                 <span className="ml-3 font-mono text-xs text-gray-500 bg-gray-200 px-2 py-0.5 rounded shadow-sm">{step.duration_sec?.toFixed(2)}s</span>
                                 
-                                {/* Visual Indicator for the log the user actually clicked */}
-                                {step.id === traceData.clicked_log_id && (
+                                {step.id === traceData.clicked_log_id && viewMode === 'trace' && (
                                   <span className="ml-3 font-semibold text-xs text-blue-700 bg-blue-100 px-2 py-0.5 rounded shadow-sm border border-blue-200">Current View</span>
                                 )}
                               </h4>
@@ -484,63 +510,58 @@ export default function App() {
                                   </div>
                                 )}
 
-                                {/* Tool Calls (Action) and their specific results */}
+                                {/* Tool Calls & Results */}
                                 {step.parsed_tools?.length > 0 && (
                                   <div className="bg-purple-50/50 border border-purple-100 p-4 rounded-lg text-sm shadow-sm">
                                      <div className="font-bold text-xs uppercase mb-2 opacity-60 text-purple-900">Tool Calls Invoked</div>
                                      {step.parsed_tools.map((tc:any, i:number) => {
-                                       // Look ahead in the full traceData.chain to see if the tool result was captured in the next request
-                                       // We use traceData.chain (not displayChain) so the result shows even if the next LLM step is hidden in plain view.
-                                      const nextStep = traceData.chain[index + 1];
-                                      
-                                      // Cross-compatibility to find tool results in OpenAI OR Anthropic schemas
-                                      const toolResultMsg = nextStep?.parsed_req?.messages?.find((m: any) => {
-                                        if (m.role === 'tool' && m.tool_call_id === tc.id) return true;
-                                        if (m.role === 'user' && Array.isArray(m.content)) {
-                                          return m.content.some((b: any) => b.type === 'tool_result' && b.tool_use_id === tc.id);
-                                        }
-                                        return false;
-                                      });
+                                       // Look ahead in the full traceData.chain (not just displayChain) for results
+                                       // To find the actual traceData index of this step:
+                                       const actualIndex = traceData.chain.findIndex((s:any) => s.id === step.id);
+                                       const nextStep = traceData.chain[actualIndex + 1];
+                                       
+                                       const toolResultMsg = nextStep?.parsed_req?.messages?.find((m: any) => {
+                                         if (m.role === 'tool' && m.tool_call_id === tc.id) return true;
+                                         if (m.role === 'user' && Array.isArray(m.content)) {
+                                           return m.content.some((b: any) => b.type === 'tool_result' && b.tool_use_id === tc.id);
+                                         }
+                                         return false;
+                                       });
 
-                                      // Extract the specific result payload to render
-                                      let resultToRender = toolResultMsg?.content;
-                                      if (toolResultMsg?.role === 'user' && Array.isArray(toolResultMsg.content)) {
-                                        const block = toolResultMsg.content.find((b: any) => b.type === 'tool_result' && b.tool_use_id === tc.id);
-                                        resultToRender = block ? [block] : null; // Wrap in array for renderMessageContent
-                                      }
+                                       let resultToRender = toolResultMsg?.content;
+                                       if (toolResultMsg?.role === 'user' && Array.isArray(toolResultMsg.content)) {
+                                         const block = toolResultMsg.content.find((b: any) => b.type === 'tool_result' && b.tool_use_id === tc.id);
+                                         resultToRender = block ? [block] : null;
+                                       }
 
-                                      return (
-                                        <div key={i} className="font-mono text-xs bg-white rounded border border-purple-100 mb-3 last:mb-0 shadow-sm overflow-hidden">
-                                          <div className="p-3">
-                                            <span className="font-bold text-purple-700">{tc.name}</span>
-                                             {/* Fixed argument rendering here */}
-                                            ({renderArgs(tc.arguments)})
-                                            <div className="text-gray-400 mt-1 text-[10px]">ID: {tc.id}</div>
-                                          </div>
-                                          
-                                          {resultToRender && (
+                                       return (
+                                         <div key={i} className="font-mono text-xs bg-white rounded border border-purple-100 mb-3 last:mb-0 shadow-sm overflow-hidden">
+                                           <div className="p-3">
+                                             <span className="font-bold text-purple-700">{tc.name}</span>
+                                             ({renderArgs(tc.arguments)})
+                                             <div className="text-gray-400 mt-1 text-[10px]">ID: {tc.id}</div>
+                                           </div>
+                                           
+                                           {resultToRender && (
                                               <div className="bg-orange-50/80 border-t border-purple-50 p-3 text-orange-900 flex items-start">
                                                 <CornerDownRight className="w-3 h-3 mr-2 mt-0.5 text-orange-400 flex-shrink-0" />
-                                                <div>
+                                                <div className="w-full overflow-hidden">
                                                   <span className="font-bold text-[10px] uppercase text-orange-600 block mb-1">Tool Result</span>
-                                                  {/* Fixed content block parsing here */}
                                                   <div className="whitespace-pre-wrap font-sans text-sm">{renderMessageContent(resultToRender)}</div>
                                                 </div>
                                               </div>
-                                          )}
-                                        </div>
-                                      )
-                                    })}
+                                           )}
+                                         </div>
+                                       )
+                                     })}
                                   </div>
                                 )}
 
-                                {/* Final Response Text - Conditionally rendered to avoid empty boxes */}
+                                {/* Final Response Text */}
                                 {hasFinalText && (
                                   <div className="bg-gray-900 text-gray-100 p-4 rounded-lg text-sm shadow-md">
                                     <div className="font-bold text-xs uppercase mb-2 text-green-400">Response output</div>
-                                    {renderFinalText(
-                                      step.final_text,
-                                      step.response_body_raw,
+                                    {renderFinalText(step.final_text, step.response_body_raw,
                                       // step.parsed_tools
                                       )}
                                   </div>
