@@ -121,15 +121,26 @@ export default function App() {
             }
             if (block.type === 'tool_use') {
               return (
-                <div key={i} className="text-xs font-mono bg-purple-100/50 p-2 rounded text-purple-800">
-                  <Wrench className="w-3 h-3 inline mr-1"/> Action: {block.name}
+                // <div key={i} className="text-xs font-mono bg-purple-100/50 p-2 rounded text-purple-800">
+                //   <Wrench className="w-3 h-3 inline mr-1"/> Action: {block.name}
+                // </div>
+                <div key={i} className="mt-3 space-y-2">
+                  <span className="text-xs uppercase font-bold text-purple-600 opacity-70">Triggered Tools:</span>
+                      <div className="bg-white/60 p-2 rounded border border-gray-200 text-xs font-mono shadow-sm">
+                        <span className="font-bold text-purple-700">{block.name}</span>
+                        <span className="text-gray-600">({renderArgs(block.input)})</span>
+                      </div>
                 </div>
+                  
               );
             }
             if (block.type === 'tool_result') {
                return (
+                //  <div key={i} className="text-xs font-mono bg-orange-50 p-2 rounded text-orange-800">
+                //     <CornerDownRight className="w-3 h-3 inline mr-1"/> Tool Result: {renderMessageContent(block.content)}
+                //  </div>
                  <div key={i} className="text-xs font-mono bg-orange-50 p-2 rounded text-orange-800">
-                    <CornerDownRight className="w-3 h-3 inline mr-1"/> Tool Result: {renderMessageContent(block.content)}
+                    {renderMessageContent(block.content)}
                  </div>
                );
             }
