@@ -33,6 +33,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+
 @app.get("/api/metrics")
 async def get_metrics():
     async with db_pool.acquire() as conn:
@@ -58,6 +59,7 @@ async def get_metrics():
             "chart_data": [dict(row) for row in daily_stats]
         }
 
+
 @app.get("/api/logs")
 async def get_logs(limit: int = 50, offset: int = 0, search: str = "", view: str = "plain"):
     async with db_pool.acquire() as conn:
@@ -69,12 +71,21 @@ async def get_logs(limit: int = 50, offset: int = 0, search: str = "", view: str
             base_where += f" AND (final_text ILIKE ${len(params)} OR final_reasoning_text ILIKE ${len(params)} OR request_body_json::text ILIKE ${len(params)})"
 
         if view == "trace":
-            # Show the root (first) node of a trace
+            # --- FIX: Robust Filter for Trace Parents ---
+            # Excludes OpenAI follow-ups (role = tool) AND Anthropic
+            # follow-ups (role = user + tool_result block)
             base_where += """
                 AND NOT (
                     jsonb_typeof(request_body_json->'messages') = 'array'
                     AND jsonb_array_length(request_body_json->'messages') > 0
-                    AND request_body_json->'messages'->-1->>'role' = 'tool'
+                    AND (
+                        request_body_json->'messages'->-1->>'role' = 'tool'
+                        OR (
+                            request_body_json->'messages'->-1->>'role' = 'user'
+                            AND jsonb_typeof(request_body_json->'messages'->-1->'content') = 'array'
+                            AND request_body_json->'messages'->-1->'content' @> '[{"type": "tool_result"}]'::jsonb
+                        )
+                    )
                 )
             """
 
@@ -100,6 +111,7 @@ async def get_logs(limit: int = 50, offset: int = 0, search: str = "", view: str
 
         return {"total": total_count, "logs": result}
 
+
 @app.get("/api/traces/{log_id}")
 async def get_trace(log_id: int):
     """
@@ -120,19 +132,31 @@ async def get_trace(log_id: int):
         clicked_log = parse_log(initial_log)
         chain = [clicked_log]
 
-        # 1. BUILD BACKWARDS (Find Parents)
+        # --- FIX: BUILD BACKWARDS (Find Parents for both Schemas) ---
         curr = clicked_log
-        for _ in range(20): # Safety limit
+        for _ in range(20):
             messages = curr.get('parsed_req', {}).get('messages', [])
-            tool_messages = [m for m in messages if m.get('role') == 'tool']
-            if not tool_messages:
+            if not messages:
                 break
 
-            # Find the ID of the tool response we just sent
-            last_tc_id = tool_messages[-1].get('tool_call_id')
-            if not last_tc_id: break
+            last_tc_id = None
 
-            # Find the parent request that asked for this tool
+            # Check OpenAI schema
+            tool_messages = [m for m in messages if m.get('role') == 'tool']
+            if tool_messages:
+                last_tc_id = tool_messages[-1].get('tool_call_id')
+            else:
+                # Check Anthropic schema
+                for m in reversed(messages):
+                    if m.get('role') == 'user' and isinstance(m.get('content'), list):
+                        tool_results = [b for b in m['content'] if b.get('type') == 'tool_result']
+                        if tool_results:
+                            last_tc_id = tool_results[-1].get('tool_use_id')
+                            break
+
+            if not last_tc_id:
+                break
+
             parent_log = await conn.fetchrow('''
                 SELECT * FROM api_logs
                 WHERE id < $1
@@ -142,11 +166,11 @@ async def get_trace(log_id: int):
 
             if parent_log:
                 curr = parse_log(parent_log)
-                chain.insert(0, curr) # Prepend to chain
+                chain.insert(0, curr)  # Prepend to chain
             else:
                 break
 
-        # 2. BUILD FORWARDS (Find Children)
+        # BUILD FORWARDS (Find Children)
         curr = clicked_log
         for _ in range(20):
             parsed_tools = curr.get('parsed_tools', [])
@@ -154,9 +178,9 @@ async def get_trace(log_id: int):
                 break
 
             tc_id = parsed_tools[0].get("id")
-            if not tc_id: break
+            if not tc_id:
+                break
 
-            # Find the child request that contains the tool response
             child_log = await conn.fetchrow('''
                 SELECT * FROM api_logs
                 WHERE id > $1
@@ -166,7 +190,7 @@ async def get_trace(log_id: int):
 
             if child_log:
                 curr = parse_log(child_log)
-                chain.append(curr) # Append to chain
+                chain.append(curr)  # Append to chain
             else:
                 break
 

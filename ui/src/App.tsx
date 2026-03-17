@@ -141,6 +141,16 @@ export default function App() {
     return <pre className="text-xs whitespace-pre-wrap opacity-70">{JSON.stringify(content, null, 2)}</pre>;
   };
 
+  // Safely extracts a text preview from either strings or Anthropic block arrays
+  const getPreviewText = (content: any): string => {
+    if (!content) return '';
+    if (typeof content === 'string') return content;
+    if (Array.isArray(content)) {
+      return content.map(b => b.text || (typeof b.content === 'string' ? b.content : '')).join(' ');
+    }
+    return JSON.stringify(content);
+  };
+
 
   return (
     <div className="min-h-screen bg-gray-50 text-gray-900 font-sans p-8 w-full flex justify-center">
@@ -318,9 +328,9 @@ export default function App() {
                   {/* Summary Preview */}
                   <div className="w-2/4 text-sm truncate pr-4 text-gray-700">
                     {log.parsed_tools.length > 0 
-                      ? <span className="bg-purple-100 text-purple-700 px-2 py-0.5 rounded text-xs mr-2 flex-inline items-center"><Wrench className="w-3 h-3 inline mr-1"/>{log.parsed_tools.map((t:any)=>t.name).join(', ')}</span> 
+                      ? <span className="bg-purple-100 text-purple-700 px-2 py-0.5 rounded text-xs mr-2 inline-flex items-center"><Wrench className="w-3 h-3 inline mr-1"/>{log.parsed_tools.map((t:any)=>t.name).join(', ')}</span> 
                       : null}
-                    {log.final_text || (log.request_body?.messages?.slice(-1)[0]?.content) || 'Streaming Session'}
+                    {log.final_text || getPreviewText(log.request_body?.messages?.slice(-1)[0]?.content) || 'Streaming Session'}
                   </div>
                   
                   <div className="w-1/4 text-right flex justify-end space-x-4 text-sm text-gray-500">
@@ -481,31 +491,46 @@ export default function App() {
                                      {step.parsed_tools.map((tc:any, i:number) => {
                                        // Look ahead in the full traceData.chain to see if the tool result was captured in the next request
                                        // We use traceData.chain (not displayChain) so the result shows even if the next LLM step is hidden in plain view.
-                                       const nextStep = traceData.chain[index + 1];
-                                       const toolResultMsg = nextStep?.parsed_req?.messages?.find((m: any) => m.role === 'tool' && m.tool_call_id === tc.id);
+                                      const nextStep = traceData.chain[index + 1];
+                                      
+                                      // Cross-compatibility to find tool results in OpenAI OR Anthropic schemas
+                                      const toolResultMsg = nextStep?.parsed_req?.messages?.find((m: any) => {
+                                        if (m.role === 'tool' && m.tool_call_id === tc.id) return true;
+                                        if (m.role === 'user' && Array.isArray(m.content)) {
+                                          return m.content.some((b: any) => b.type === 'tool_result' && b.tool_use_id === tc.id);
+                                        }
+                                        return false;
+                                      });
 
-                                       return (
-                                         <div key={i} className="font-mono text-xs bg-white rounded border border-purple-100 mb-3 last:mb-0 shadow-sm overflow-hidden">
-                                           <div className="p-3">
-                                             <span className="font-bold text-purple-700">{tc.name}</span>
+                                      // Extract the specific result payload to render
+                                      let resultToRender = toolResultMsg?.content;
+                                      if (toolResultMsg?.role === 'user' && Array.isArray(toolResultMsg.content)) {
+                                        const block = toolResultMsg.content.find((b: any) => b.type === 'tool_result' && b.tool_use_id === tc.id);
+                                        resultToRender = block ? [block] : null; // Wrap in array for renderMessageContent
+                                      }
+
+                                      return (
+                                        <div key={i} className="font-mono text-xs bg-white rounded border border-purple-100 mb-3 last:mb-0 shadow-sm overflow-hidden">
+                                          <div className="p-3">
+                                            <span className="font-bold text-purple-700">{tc.name}</span>
                                              {/* Fixed argument rendering here */}
-                                             ({renderArgs(tc.arguments)})
-                                             <div className="text-gray-400 mt-1 text-[10px]">ID: {tc.id}</div>
-                                           </div>
-                                           
-                                           {toolResultMsg && (
+                                            ({renderArgs(tc.arguments)})
+                                            <div className="text-gray-400 mt-1 text-[10px]">ID: {tc.id}</div>
+                                          </div>
+                                          
+                                          {resultToRender && (
                                               <div className="bg-orange-50/80 border-t border-purple-50 p-3 text-orange-900 flex items-start">
                                                 <CornerDownRight className="w-3 h-3 mr-2 mt-0.5 text-orange-400 flex-shrink-0" />
                                                 <div>
                                                   <span className="font-bold text-[10px] uppercase text-orange-600 block mb-1">Tool Result</span>
                                                   {/* Fixed content block parsing here */}
-                                                  <div className="whitespace-pre-wrap font-sans text-sm">{renderMessageContent(toolResultMsg.content)}</div>
+                                                  <div className="whitespace-pre-wrap font-sans text-sm">{renderMessageContent(resultToRender)}</div>
                                                 </div>
                                               </div>
-                                           )}
-                                         </div>
-                                       )
-                                     })}
+                                          )}
+                                        </div>
+                                      )
+                                    })}
                                   </div>
                                 )}
 

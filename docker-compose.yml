@@ -4,7 +4,7 @@ services:
   postgres:
     image: postgres:15-alpine
     container_name: llm_obs_postgres
-    restart: unless-stopped
+    restart: always
     environment:
       - POSTGRES_USER=admin
       - POSTGRES_PASSWORD=postgrespw
@@ -22,7 +22,7 @@ services:
   proxy:
     build: ./proxy
     container_name: llm_obs_proxy
-    restart: unless-stopped
+    restart: always
     ports:
       - "${PROXY_PORT:-8080}:8080"
     env_file: .env
@@ -38,7 +38,7 @@ services:
   dashboard-api:
     build: ./dashboard_api
     container_name: llm_obs_api
-    restart: unless-stopped
+    restart: always
     ports:
       - "8081:8081"
     env_file: .env
@@ -52,7 +52,7 @@ services:
   ui:
     build: ./ui
     container_name: llm_obs_ui
-    restart: unless-stopped
+    restart: always
     ports:
       - "5173:80"
     depends_on:
