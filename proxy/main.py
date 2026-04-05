@@ -22,31 +22,128 @@ try:
 except ImportError:
     pass
 
-BASE_URL = os.getenv("BASE_URL")
+# --- Bootstrap values from .env (used only for initial DB seeding) ---
+_ENV_BASE_URL = os.getenv("BASE_URL", "")
+_ENV_GLOBAL_TIMEOUT = os.getenv("GLOBAL_TIMEOUT", "150").strip()
+_ENV_MAX_RETRIES = os.getenv("MAX_RETRIES", "3").strip()
+_ENV_BASE_DELAY = os.getenv("BASE_DELAY", "3.0").strip()
+
 PROXY_HOST = os.getenv("PROXY_HOST", "0.0.0.0")
 PROXY_PORT = int(os.getenv("PROXY_PORT", 8080))
 DATABASE_URL = os.getenv("DATABASE_URL")
-GLOBAL_TIMEOUT = int(os.getenv("GLOBAL_TIMEOUT", 150))  # To Kill long request
-MAX_RETRIES = int(os.getenv('MAX_RETRIES', 3))
-BASE_DELAY = float(os.getenv('BASE_DELAY', 3.0))
 
+# --- In-memory dynamic config (refreshed from DB) ---
+_settings_cache: dict[str, str] = {}
+_apps_cache: list[dict] = []
+_cache_lock = asyncio.Lock()
+_client_pool: dict[str, httpx.AsyncClient] = {}
 
 db_pool = None
-client = None
+
+
+def get_setting(key: str, default: str = "") -> str:
+    return _settings_cache.get(key, default)
+
+
+def get_setting_int(key: str, default: int = 0) -> int:
+    try:
+        return int(get_setting(key, str(default)))
+    except (ValueError, TypeError):
+        return default
+
+
+def get_setting_float(key: str, default: float = 0.0) -> float:
+    try:
+        return float(get_setting(key, str(default)))
+    except (ValueError, TypeError):
+        return default
+
+
+async def _refresh_config():
+    """Periodically refresh settings and apps from the database."""
+    global _settings_cache, _apps_cache
+    while True:
+        try:
+            if db_pool:
+                async with db_pool.acquire() as conn:
+                    rows = await conn.fetch("SELECT key, value FROM settings")
+                    new_settings = {r["key"]: r["value"] for r in rows}
+
+                    app_rows = await conn.fetch(
+                        "SELECT id, slug, name, target_url, is_default FROM apps ORDER BY is_default DESC, name ASC"
+                    )
+                    new_apps = [dict(r) for r in app_rows]
+
+                async with _cache_lock:
+                    _settings_cache = new_settings
+                    _apps_cache = new_apps
+
+                # Clean up clients for removed origins
+                active_origins = set()
+                for a in new_apps:
+                    active_origins.add(a["target_url"].rstrip("/"))
+                base_url = new_settings.get("BASE_URL", "")
+                if base_url:
+                    active_origins.add(base_url.rstrip("/"))
+
+                stale = [k for k in _client_pool if k not in active_origins]
+                for k in stale:
+                    c = _client_pool.pop(k)
+                    await c.aclose()
+
+        except Exception as e:
+            logger.debug(f"Config refresh error: {e}")
+
+        await asyncio.sleep(5)
+
+
+def _get_client(base_url: str) -> httpx.AsyncClient:
+    """Get or create an httpx.AsyncClient for the given base_url."""
+    key = base_url.rstrip("/")
+    if key not in _client_pool:
+        _client_pool[key] = httpx.AsyncClient(base_url=key, timeout=None)
+        logger.info(f"Created new httpx client for: {key}")
+    return _client_pool[key]
+
+
+def _resolve_app(path: str) -> tuple[str, str, str]:
+    """
+    Given a request path, resolve the app slug and target URL.
+    Returns (app_slug, target_base_url, remaining_path).
+    """
+    # Check for /app-{slug}/... pattern
+    match = re.match(r'^app-([^/]+)(?:/(.*))?$', path)
+    if match:
+        slug = match.group(1)
+        remaining = match.group(2) or ""
+
+        for app in _apps_cache:
+            if app["slug"] == slug:
+                return slug, app["target_url"].rstrip("/"), remaining
+
+        # Slug not found — treat as unknown, use default
+        logger.warning(f"Unknown app slug '{slug}', falling back to default")
+
+    # No app- prefix or unknown slug: use default app or BASE_URL setting
+    for app in _apps_cache:
+        if app.get("is_default"):
+            return app["slug"], app["target_url"].rstrip("/"), path
+
+    # Final fallback: BASE_URL from settings
+    fallback = get_setting("BASE_URL", _ENV_BASE_URL)
+    return "default", fallback.rstrip("/") if fallback else "", path
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global db_pool, client
+    global db_pool
 
-    # Initialize the HTTPX client here so all workers get it
-    client = httpx.AsyncClient(base_url=BASE_URL, timeout=None)
-    logger.info(f"Initialized httpx client pointing to {BASE_URL}")
     # Database Initialization
     if DATABASE_URL:
         try:
             db_pool = await asyncpg.create_pool(DATABASE_URL)
             async with db_pool.acquire() as conn:
+                # Original api_logs table
                 await conn.execute('''
                     CREATE TABLE IF NOT EXISTS api_logs (
                         id SERIAL PRIMARY KEY,
@@ -69,21 +166,108 @@ async def lifespan(app: FastAPI):
                         created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
                     )
                 ''')
-                # Create GIN indexes for fast JSON searching
+                # Add app_slug column if it doesn't exist
+                await conn.execute('''
+                    DO $$
+                    BEGIN
+                        IF NOT EXISTS (
+                            SELECT 1 FROM information_schema.columns
+                            WHERE table_name='api_logs' AND column_name='app_slug'
+                        ) THEN
+                            ALTER TABLE api_logs ADD COLUMN app_slug TEXT DEFAULT 'default';
+                        END IF;
+                    END $$;
+                ''')
+
+                # GIN indexes
                 await conn.execute('CREATE INDEX IF NOT EXISTS idx_logs_body ON api_logs USING GIN (request_body_json)')
                 await conn.execute('CREATE INDEX IF NOT EXISTS idx_logs_tools ON api_logs USING GIN (tool_calls)')
+                await conn.execute('CREATE INDEX IF NOT EXISTS idx_logs_app_slug ON api_logs (app_slug)')
+
+                # Settings table
+                await conn.execute('''
+                    CREATE TABLE IF NOT EXISTS settings (
+                        key TEXT PRIMARY KEY,
+                        value TEXT NOT NULL,
+                        updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+                    )
+                ''')
+
+                # Apps table
+                await conn.execute('''
+                    CREATE TABLE IF NOT EXISTS apps (
+                        id SERIAL PRIMARY KEY,
+                        slug TEXT UNIQUE NOT NULL,
+                        name TEXT NOT NULL,
+                        target_url TEXT NOT NULL,
+                        is_default BOOLEAN DEFAULT FALSE,
+                        created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+                    )
+                ''')
+
+                # Seed settings from .env if table is empty
+                count = await conn.fetchval("SELECT COUNT(*) FROM settings")
+                if count == 0:
+                    logger.info("Seeding settings table from .env values...")
+                    seeds = {
+                        "BASE_URL": _ENV_BASE_URL,
+                        "GLOBAL_TIMEOUT": _ENV_GLOBAL_TIMEOUT,
+                        "MAX_RETRIES": _ENV_MAX_RETRIES,
+                        "BASE_DELAY": _ENV_BASE_DELAY,
+                    }
+                    for k, v in seeds.items():
+                        if v:
+                            await conn.execute(
+                                "INSERT INTO settings (key, value) VALUES ($1, $2) ON CONFLICT (key) DO NOTHING",
+                                k, str(v)
+                            )
+
+                # Seed default app from BASE_URL if apps table is empty
+                app_count = await conn.fetchval("SELECT COUNT(*) FROM apps")
+                if app_count == 0 and _ENV_BASE_URL:
+                    logger.info("Seeding default app from BASE_URL...")
+                    await conn.execute(
+                        "INSERT INTO apps (slug, name, target_url, is_default) VALUES ($1, $2, $3, $4)",
+                        "default", "Default", _ENV_BASE_URL, True
+                    )
+
             logger.info("Database and Schema ready.")
+
+            # Load initial config into cache
+            async with db_pool.acquire() as conn:
+                rows = await conn.fetch("SELECT key, value FROM settings")
+                for r in rows:
+                    _settings_cache[r["key"]] = r["value"]
+
+                app_rows = await conn.fetch(
+                    "SELECT id, slug, name, target_url, is_default FROM apps ORDER BY is_default DESC, name ASC"
+                )
+                _apps_cache.clear()
+                _apps_cache.extend([dict(r) for r in app_rows])
+
+            logger.info(f"Loaded {len(_settings_cache)} settings and {len(_apps_cache)} apps from DB.")
+
+            # Start background config refresh
+            refresh_task = asyncio.create_task(_refresh_config())
+
         except Exception as e:
             logger.error(f"DB Connection Error: {e}")
     else:
-        logger.warning(
-            "DATABASE_URL is not set. Logging to DB will be skipped.")
+        logger.warning("DATABASE_URL is not set. Logging to DB will be skipped.")
+        # Fall back to env vars for settings
+        _settings_cache["BASE_URL"] = _ENV_BASE_URL
+        _settings_cache["GLOBAL_TIMEOUT"] = _ENV_GLOBAL_TIMEOUT
+        _settings_cache["MAX_RETRIES"] = _ENV_MAX_RETRIES
+        _settings_cache["BASE_DELAY"] = _ENV_BASE_DELAY
+
     yield  # App runs here
+
     # Cleanup on shutdown
     if db_pool:
         await db_pool.close()
-    if client:
-        await client.aclose()  # Clean up the HTTP client
+    for c in _client_pool.values():
+        await c.aclose()
+    _client_pool.clear()
 
 app = FastAPI(title="OpenInspector Proxy", lifespan=lifespan)
 
@@ -133,6 +317,7 @@ async def process_log(log: dict):
     req = log["request"]
     res = log["response"]
     resp_data = res.get("response", {})
+    app_slug = log.get("app_slug", "default")
 
     # Provider-Agnostic Content Extraction
     final_text = resp_data.get("final_text", "")
@@ -177,8 +362,9 @@ async def process_log(log: dict):
                     final_text,
                     final_reasoning_text,
                     tool_calls,
-                    duration_sec
-                ) VALUES ($1, $2, $3::jsonb, $4::jsonb, $5, $6, $7::jsonb, $8, $9::jsonb, $10, $11, $12::jsonb, $13, $14, $15::jsonb, $16)
+                    duration_sec,
+                    app_slug
+                ) VALUES ($1, $2, $3::jsonb, $4::jsonb, $5, $6, $7::jsonb, $8, $9::jsonb, $10, $11, $12::jsonb, $13, $14, $15::jsonb, $16, $17)
                 ''',
                 str(req.get("url")),
                 req.get("method"),
@@ -195,7 +381,8 @@ async def process_log(log: dict):
                 final_text,
                 final_reasoning,
                 json.dumps(normalize_tool_calls(raw_tools)),
-                res.get("duration_sec")
+                res.get("duration_sec"),
+                app_slug
             )
         log['logged'] = True
     except Exception as e:
@@ -220,12 +407,13 @@ async def stream_ollama_response(
         response: httpx.Response, start_time: float, store: dict):
     full_body = bytearray()
     content_type = response.headers.get("content-type", "").lower()
+    global_timeout = get_setting_int("GLOBAL_TIMEOUT", 150)
 
     try:
         # Wrap the stream consumption in a timeout
         async for chunk in response.aiter_bytes():
-            if time.time() - start_time > GLOBAL_TIMEOUT:
-                logger.error(f"Streaming exceeded {GLOBAL_TIMEOUT}s timeout.")
+            if time.time() - start_time > global_timeout:
+                logger.error(f"Streaming exceeded {global_timeout}s timeout.")
                 break
             full_body.extend(chunk)
             yield chunk
@@ -381,6 +569,23 @@ async def proxy(request: Request, path: str):
     body = await request.body()
     req_store = {}
 
+    # Resolve target app
+    app_slug, target_base_url, remaining_path = _resolve_app(path)
+    req_store["app_slug"] = app_slug
+
+    if not target_base_url:
+        return Response(
+            content="No target URL configured. Set BASE_URL in settings or create an app.",
+            status_code=502)
+
+    # Get dynamic settings
+    global_timeout = get_setting_int("GLOBAL_TIMEOUT", 150)
+    max_retries = get_setting_int("MAX_RETRIES", 3)
+    base_delay = get_setting_float("BASE_DELAY", 3.0)
+
+    # Get/create client for target
+    target_client = _get_client(target_base_url)
+
     # Header Preparation (Fixing DecodingError)
     fwd_headers = {k: v for k, v in request.headers.items()
                    if k.lower() not in [
@@ -391,34 +596,36 @@ async def proxy(request: Request, path: str):
     try:
         # 1. Retry and Timeout Logic for the Initial Connection
         response = None
-        for attempt in range(MAX_RETRIES):
+        for attempt in range(max_retries):
             try:
-                req = client.build_request(
+                # Use remaining_path (with app- prefix stripped)
+                forward_path = f"/{remaining_path}" if remaining_path else "/"
+                req = target_client.build_request(
                     request.method,
-                    request.url.path,
+                    forward_path,
                     headers=fwd_headers,
                     content=body,
                     params=request.query_params
                 )
                 # Ensure the network request doesn't hang forever
                 response = await asyncio.wait_for(
-                    client.send(req, stream=True), timeout=GLOBAL_TIMEOUT)
+                    target_client.send(req, stream=True), timeout=global_timeout)
 
                 if response.status_code == 429:
                     logger.warning(f"Rate Limited (429). Attempt {attempt+1}")
                     await response.aclose()
                     await asyncio.sleep(
-                        BASE_DELAY * (2 ** attempt) + random.uniform(0, 1))
+                        base_delay * (2 ** attempt) + random.uniform(0, 1))
                     continue
                 break
             except asyncio.TimeoutError:
                 logger.error(
                     "Request timed out during connection "
                     f"(Attempt {attempt+1})")
-                if attempt == MAX_RETRIES - 1:
+                if attempt == max_retries - 1:
                     raise
             except Exception as e:
-                if attempt == MAX_RETRIES - 1:
+                if attempt == max_retries - 1:
                     raise e
                 await asyncio.sleep(1)
 
@@ -436,7 +643,7 @@ async def proxy(request: Request, path: str):
             )
         else:
             # Wrap standard reading in a timeout
-            await asyncio.wait_for(response.aread(), timeout=GLOBAL_TIMEOUT)
+            await asyncio.wait_for(response.aread(), timeout=global_timeout)
             duration = time.time() - start_time
             decoded_res = response.content.decode('utf-8', errors='replace')
             req_store["response"] = {
@@ -458,7 +665,7 @@ async def proxy(request: Request, path: str):
 
     except asyncio.TimeoutError:
         return Response(
-            content=f"Request exceeded {GLOBAL_TIMEOUT} sec timeout",
+            content=f"Request exceeded {global_timeout} sec timeout",
             status_code=504)
     except Exception as e:
         logger.exception("Proxy Error")
@@ -466,11 +673,7 @@ async def proxy(request: Request, path: str):
             content=f"Internal Proxy Error: {str(e)}", status_code=502)
 
 if __name__ == "__main__":
-    logger.info(f'BASE_URL : {BASE_URL}')
     logger.info(f'PROXY_HOST      : {PROXY_HOST}')
     logger.info(f'PROXY_PORT      : {PROXY_PORT}')
     logger.info(f'DATABASE_URL    : {DATABASE_URL}')
-    logger.info(f'GLOBAL_TIMEOUT  : {GLOBAL_TIMEOUT}')
-    logger.info(f'MAX_RETRIES     : {MAX_RETRIES}')
-    logger.info(f'BASE_DELAY      : {BASE_DELAY}')
     uvicorn.run("main:app", host=PROXY_HOST, port=PROXY_PORT, reload=False)
