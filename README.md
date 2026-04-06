@@ -2,20 +2,31 @@
 
 A lightweight, local-first observability proxy and dashboard designed to intercept, log, and trace LLM interactions. OpenInspector acts as a transparent middleman, offering full visibility into agentic workflows, tool executions, and latency metrics **without requiring you to change a single line of your application code.**
 
-![OpenInspector Dashboard Preview](resources/all_records_view.png)
-
 
 ## ✨ Features
 
-* **Zero-Instrumentation Drop-in Proxy:** Unlike standard observability frameworks (e.g., LangSmith, DataDog) that require you to install heavy SDK wrappers or inject callback handlers, OpenInspector works purely at the network level. Just change your `BASE_URL`. 
+* **Zero-Instrumentation Drop-in Proxy:** Unlike standard observability frameworks (e.g., LangSmith, DataDog) that require you to install heavy SDK wrappers or inject callback handlers, OpenInspector works purely at the network level. Just change your `BASE_URL`.
   * *Perfect for:* No-code/Low-code platforms (n8n, Flowise, Langflow) or pre-compiled autonomous agents (like OpenClaw, etc.) where injecting custom Python/JS instrumentation code is impractical or impossible.
 
+* **Dynamic UI & Configuration:**
+  * **Dynamic Multi-App Routing:** Deploy the proxy once and handle multiple LLM targets concurrently by routing through `/app-{slug}` endpoints or the default app configuration. Manage all targets from the dashboard without touching `.env` files or restarting services!
+
+  <table>
+    <tr>
+      <td><img src="resources/dynamic_config1.png" width="100%"/></td>
+    </tr>
+  </table>
+
+  * **Revamped Dashboard:** A modern, feature-rich user interface designed for maximum visibility into your agent workflows.
+  * **Raw Database Inspection & Management:** View raw database records directly in the UI and easily delete unnecessary logs to maintain a clean trace history.
+  
 * **Agent Trace Linking:** Automatically stitches together multi-step agent tool calls and LLM responses into a unified, visually readable timeline.
   
   ![Agent Trace Timeline](resources/trace_view.png)
 
 * **Intelligent Stream Parsing:** Extracts hidden reasoning/thought blocks and fragmented tool-calls from complex stream payloads (Supports OpenAI, OpenRouter, and native Ollama formats).
-* **Resilience & Protection:** * **Rate Limits:** Built-in exponential backoff and retry logic automatically handles `429 Too Many Requests` errors from providers like OpenRouter.
+* **Resilience & Protection:** 
+  * **Rate Limits:** Built-in exponential backoff and retry logic automatically handles `429 Too Many Requests` errors from providers like OpenRouter.
   * **Timeouts:** Includes a strict global timeout monitor to automatically sever connections if a local model hallucinates and gets stuck in an infinite generation loop.
 * **Fine-tuning Dataset Curation:** 1-click export of clean, successful conversation traces into OpenAI-compatible JSONL format (`{"messages": [...]}`). Use this to easily capture data from expensive frontier models (GPT-4, Claude) to fine-tune your own smaller, local models.
 * **Local First:** Everything runs locally via Docker Compose. Your sensitive prompts and data never leave your machine.
@@ -37,7 +48,7 @@ Create a `.env` file from the provided example:
 ```bash
 cp .env.example .env
 ```
-Edit the `.env` file to set your target LLM provider (e.g., OpenRouter or local Ollama instance, or any OpenAI compatible endpoint.). 
+With the new dynamic configuration UI, the `.env` file primarily serves to seed the initial database connection. Once the stack is running, you can manage LLM target providers and app routing directly via the dashboard.
 
 ### 4. Start the Stack
 We provide a convenient CLI tool to manage the stack.
@@ -57,7 +68,7 @@ To use the proxy, you do not need to install any new packages. Simply point your
 ```python
 from openai import OpenAI
 
-base_url = "http://localhost:8080", # While in ".env" file, BASE_URL = https://openrouter.ai/api/v1
+base_url = "http://localhost:8080", # To target a specific app setup in UI, use "http://localhost:8080/app-slug"
 api_key = "your-actual-api-key"
 
 client = OpenAI(
@@ -75,9 +86,9 @@ response = client.chat.completions.create(
 ```python
 from openai import OpenAI
 
-base_url = "http://localhost:8080/v1", # While in ".env" file, BASE_URL=http://host.docker.internal:11434
+base_url = "http://localhost:8080/v1", # Target URL configured in UI should be http://host.docker.internal:11434
 # Or
-# base_url = "http://localhost:8080", # While in ".env" file, BASE_URL=http://host.docker.internal:11434/v1
+# base_url = "http://localhost:8080", # Target URL configured in UI should be http://host.docker.internal:11434/v1
 
 api_key = "dummy_key_does_not_matter_for_ollama"
 
@@ -92,23 +103,23 @@ response = client.chat.completions.create(
 )
 ```
 
-> Note: OpenAI SDK expects the base_url to be ending with version, example "/v1" while Langchain usually expects one that doesn't end with version. So adjust either the BASE_URL in the `.env` or base_url in the code accordingly.
+> Note: OpenAI SDK expects the base_url to be ending with version, example "/v1" while Langchain usually expects one that doesn't end with version. So adjust either the target setup in the UI or base_url in the code accordingly.
 
  
 ### Usage with Claude Code
 
-- If using Claude Code with **Anthropic**, set the 'BASE_URL' in `.env` to Anthropic url
+- If using Claude Code with **Anthropic**, set the target URL in UI for your app to the Anthropic URL:
 
-  `BASE_URL=https://api.anthropic.com`
+  `Target URL: https://api.anthropic.com`
 
   Also, set environment variables in your terminal (or global) as:
   ```shell
   export ANTHROPIC_BASE_URL=http://localhost:8080
   ```
 
-- If using Claude Code with **OpenRouter**, set the `BASE_URL` in `.env` to OpenRouter API url
+- If using Claude Code with **OpenRouter**, set the target URL in UI for your app to the OpenRouter API URL:
   
-  `BASE_URL=https://openrouter.ai/api`
+  `Target URL: https://openrouter.ai/api`
 
   Also, set environment variables in your terminal (or global) as:
   ```shell
@@ -119,9 +130,9 @@ response = client.chat.completions.create(
   export ANTHROPIC_MODEL=any_open_router_model_example_arcee-ai/trinity-large-preview:free
   ```
 
-- If using Claude Code with Local **Ollama**, set the set the `BASE_URL` in `.env` to Ollama API url
+- If using Claude Code with Local **Ollama**, set the target URL in UI for your app to the Ollama API URL:
 
-  `BASE_URL=http://localhost:11434`
+  `Target URL: http://host.docker.internal:11434`
 
   Also, set environment variables in your terminal (or global) as:
   ```shell
@@ -132,7 +143,7 @@ response = client.chat.completions.create(
   export ANTHROPIC_MODEL=qwen3.5:9b
   ```
 
-> Note: - After making any change to `.env` file, restart the service `./open-inspector.sh stop` and `./open-inspector.sh start`
+> Note: Thanks to the dynamic configuration UI, you no longer need to restart services when adding or modifying target application endpoints!
 
  **Sample Trace Snippets from Claude Code execution**
 
