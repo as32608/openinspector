@@ -1,0 +1,16 @@
+# Build context is the repo root (shared by proxy/ and dashboard_api/ images).
+# Keep it small — exclude the UI, tooling, and local artifacts.
+ui/
+resources/
+tests/
+.venv-test/
+**/__pycache__/
+**/*.pyc
+.git/
+.gitignore
+.pytest_cache/
+*.md
+.env
+.env_bkp
+.env.*
+node_modules/

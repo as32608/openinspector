@@ -8,10 +8,11 @@ import uvicorn
 import json
 import time
 import loguru
-import asyncpg
 import asyncio
 import random
 from contextlib import asynccontextmanager
+
+from shared.oidb import make_adapter, Repository
 
 logger = loguru.logger
 pat_text_stream = re.compile(r'^data: (\{.*\})$')
@@ -27,10 +28,23 @@ _ENV_BASE_URL = os.getenv("BASE_URL", "")
 _ENV_GLOBAL_TIMEOUT = os.getenv("GLOBAL_TIMEOUT", "150").strip()
 _ENV_MAX_RETRIES = os.getenv("MAX_RETRIES", "3").strip()
 _ENV_BASE_DELAY = os.getenv("BASE_DELAY", "3.0").strip()
+_ENV_READ_TIMEOUT = os.getenv("READ_TIMEOUT", "60").strip()
 
 PROXY_HOST = os.getenv("PROXY_HOST", "0.0.0.0")
 PROXY_PORT = int(os.getenv("PROXY_PORT", 8080))
 DATABASE_URL = os.getenv("DATABASE_URL")
+
+# A DB is used when either a DATABASE_URL or an explicit DB_BACKEND is set
+# (the latter covers sqlite, which needs no URL). Otherwise the proxy runs in
+# env-only mode with no logging.
+_DB_CONFIGURED = bool(DATABASE_URL or os.getenv("DB_BACKEND"))
+
+# Database connection retry (matches dashboard_api behaviour). On a host reboot
+# the proxy can start before Postgres is ready; we retry with backoff and let
+# the process die on deadline so `restart: always` reschedules it, rather than
+# silently serving traffic with empty config caches.
+MAX_WAIT_SECONDS = 120
+RETRY_INTERVAL = 3  # seconds
 
 # --- In-memory dynamic config (refreshed from DB) ---
 _settings_cache: dict[str, str] = {}
@@ -38,7 +52,13 @@ _apps_cache: list[dict] = []
 _cache_lock = asyncio.Lock()
 _client_pool: dict[str, httpx.AsyncClient] = {}
 
-db_pool = None
+# Flips to True only once settings/apps have been loaded into the caches above
+# (either from the DB or, when DATABASE_URL is unset, from env). Until then the
+# proxy has no routing config and must not forward.
+_config_loaded = False
+
+# Data-access layer (pluggable Postgres/SQLite backend, see shared/oidb).
+repo: Repository | None = None
 
 
 def get_setting(key: str, default: str = "") -> str:
@@ -64,15 +84,10 @@ async def _refresh_config():
     global _settings_cache, _apps_cache
     while True:
         try:
-            if db_pool:
-                async with db_pool.acquire() as conn:
-                    rows = await conn.fetch("SELECT key, value FROM settings")
-                    new_settings = {r["key"]: r["value"] for r in rows}
-
-                    app_rows = await conn.fetch(
-                        "SELECT id, slug, name, target_url, is_default FROM apps ORDER BY is_default DESC, name ASC"
-                    )
-                    new_apps = [dict(r) for r in app_rows]
+            if repo:
+                new_settings = await repo.fetch_settings_map()
+                app_rows = await repo.fetch_apps()
+                new_apps = app_rows if app_rows else _apps_cache
 
                 async with _cache_lock:
                     _settings_cache = new_settings
@@ -101,8 +116,16 @@ def _get_client(base_url: str) -> httpx.AsyncClient:
     """Get or create an httpx.AsyncClient for the given base_url."""
     key = base_url.rstrip("/")
     if key not in _client_pool:
-        _client_pool[key] = httpx.AsyncClient(base_url=key, timeout=None)
-        logger.info(f"Created new httpx client for: {key}")
+        # Bound per-operation timeouts so a stalled upstream (e.g. a model that
+        # stops emitting chunks mid-stream) is detected promptly. pool=None
+        # leaves connection-pool acquisition unbounded. The cumulative
+        # GLOBAL_TIMEOUT still caps total stream duration separately.
+        read_timeout = get_setting_float("READ_TIMEOUT", 60.0)
+        timeout = httpx.Timeout(
+            connect=10.0, read=read_timeout, write=10.0, pool=None)
+        _client_pool[key] = httpx.AsyncClient(base_url=key, timeout=timeout)
+        logger.info(
+            f"Created new httpx client for: {key} (read_timeout={read_timeout}s)")
     return _client_pool[key]
 
 
@@ -123,6 +146,8 @@ def _resolve_app(path: str) -> tuple[str, str, str]:
 
         # Slug not found — treat as unknown, use default
         logger.warning(f"Unknown app slug '{slug}', falling back to default")
+        logger.debug(f"Available apps: {[a['slug'] for a in _apps_cache]}")
+
 
     # No app- prefix or unknown slug: use default app or BASE_URL setting
     for app in _apps_cache:
@@ -136,122 +161,64 @@ def _resolve_app(path: str) -> tuple[str, str, str]:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global db_pool
+    global repo, _config_loaded
 
     # Database Initialization
-    if DATABASE_URL:
+    if _DB_CONFIGURED:
+        repo = Repository(make_adapter())
+
+        # 1. Connect with retry/backoff. Raise on deadline so the container
+        #    restarts instead of running with no DB.
+        start_time = time.monotonic()
+        while True:
+            try:
+                await repo.connect()
+                logger.info(f"Connected to database (backend={repo.backend})")
+                break
+            except Exception:
+                if time.monotonic() - start_time > MAX_WAIT_SECONDS:
+                    logger.error(
+                        "Could not connect to database within "
+                        f"{MAX_WAIT_SECONDS}s; exiting so the container restarts.")
+                    raise
+                logger.warning(
+                    f"DB not ready yet, retrying in {RETRY_INTERVAL}s...")
+                await asyncio.sleep(RETRY_INTERVAL)
+
+        # 2. Schema + seed. Let errors propagate (fail loud) — a half-initialised
+        #    schema must not be papered over.
         try:
-            db_pool = await asyncpg.create_pool(DATABASE_URL)
-            async with db_pool.acquire() as conn:
-                # Original api_logs table
-                await conn.execute('''
-                    CREATE TABLE IF NOT EXISTS api_logs (
-                        id SERIAL PRIMARY KEY,
-                        url TEXT,
-                        method VARCHAR(10),
-                        query_params JSONB,
-                        request_headers JSONB,
-                        request_content_type VARCHAR(255),
-                        request_body_raw TEXT,
-                        request_body_json JSONB,
-                        response_status_code INTEGER,
-                        response_headers JSONB,
-                        response_content_type VARCHAR(255),
-                        response_body_raw TEXT,
-                        response_body_json JSONB,
-                        final_text TEXT,
-                        final_reasoning_text TEXT,
-                        tool_calls JSONB,
-                        duration_sec FLOAT,
-                        created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
-                    )
-                ''')
-                # Add app_slug column if it doesn't exist
-                await conn.execute('''
-                    DO $$
-                    BEGIN
-                        IF NOT EXISTS (
-                            SELECT 1 FROM information_schema.columns
-                            WHERE table_name='api_logs' AND column_name='app_slug'
-                        ) THEN
-                            ALTER TABLE api_logs ADD COLUMN app_slug TEXT DEFAULT 'default';
-                        END IF;
-                    END $$;
-                ''')
+            await repo.ensure_schema()
+            await repo.seed_initial(
+                settings_seeds={
+                    "BASE_URL": _ENV_BASE_URL,
+                    "GLOBAL_TIMEOUT": _ENV_GLOBAL_TIMEOUT,
+                    "MAX_RETRIES": _ENV_MAX_RETRIES,
+                    "BASE_DELAY": _ENV_BASE_DELAY,
+                    "READ_TIMEOUT": _ENV_READ_TIMEOUT,
+                },
+                default_app=({
+                    "slug": "default", "name": "Default",
+                    "target_url": _ENV_BASE_URL,
+                } if _ENV_BASE_URL else None),
+            )
+        except Exception:
+            logger.exception("Schema initialization failed; exiting.")
+            raise
 
-                # GIN indexes
-                await conn.execute('CREATE INDEX IF NOT EXISTS idx_logs_body ON api_logs USING GIN (request_body_json)')
-                await conn.execute('CREATE INDEX IF NOT EXISTS idx_logs_tools ON api_logs USING GIN (tool_calls)')
-                await conn.execute('CREATE INDEX IF NOT EXISTS idx_logs_app_slug ON api_logs (app_slug)')
+        logger.info("Database and Schema ready.")
 
-                # Settings table
-                await conn.execute('''
-                    CREATE TABLE IF NOT EXISTS settings (
-                        key TEXT PRIMARY KEY,
-                        value TEXT NOT NULL,
-                        updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
-                    )
-                ''')
+        # 3. Load initial config into cache before serving any traffic.
+        _settings_cache.update(await repo.fetch_settings_map())
+        _apps_cache.clear()
+        _apps_cache.extend(await repo.fetch_apps())
 
-                # Apps table
-                await conn.execute('''
-                    CREATE TABLE IF NOT EXISTS apps (
-                        id SERIAL PRIMARY KEY,
-                        slug TEXT UNIQUE NOT NULL,
-                        name TEXT NOT NULL,
-                        target_url TEXT NOT NULL,
-                        is_default BOOLEAN DEFAULT FALSE,
-                        created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
-                    )
-                ''')
+        _config_loaded = True
+        logger.info(f"Loaded {len(_settings_cache)} settings and {len(_apps_cache)} apps from DB.")
 
-                # Seed settings from .env if table is empty
-                count = await conn.fetchval("SELECT COUNT(*) FROM settings")
-                if count == 0:
-                    logger.info("Seeding settings table from .env values...")
-                    seeds = {
-                        "BASE_URL": _ENV_BASE_URL,
-                        "GLOBAL_TIMEOUT": _ENV_GLOBAL_TIMEOUT,
-                        "MAX_RETRIES": _ENV_MAX_RETRIES,
-                        "BASE_DELAY": _ENV_BASE_DELAY,
-                    }
-                    for k, v in seeds.items():
-                        if v:
-                            await conn.execute(
-                                "INSERT INTO settings (key, value) VALUES ($1, $2) ON CONFLICT (key) DO NOTHING",
-                                k, str(v)
-                            )
+        # 4. Start background config refresh (kept on app state so it isn't GC'd)
+        app.state.refresh_task = asyncio.create_task(_refresh_config())
 
-                # Seed default app from BASE_URL if apps table is empty
-                app_count = await conn.fetchval("SELECT COUNT(*) FROM apps")
-                if app_count == 0 and _ENV_BASE_URL:
-                    logger.info("Seeding default app from BASE_URL...")
-                    await conn.execute(
-                        "INSERT INTO apps (slug, name, target_url, is_default) VALUES ($1, $2, $3, $4)",
-                        "default", "Default", _ENV_BASE_URL, True
-                    )
-
-            logger.info("Database and Schema ready.")
-
-            # Load initial config into cache
-            async with db_pool.acquire() as conn:
-                rows = await conn.fetch("SELECT key, value FROM settings")
-                for r in rows:
-                    _settings_cache[r["key"]] = r["value"]
-
-                app_rows = await conn.fetch(
-                    "SELECT id, slug, name, target_url, is_default FROM apps ORDER BY is_default DESC, name ASC"
-                )
-                _apps_cache.clear()
-                _apps_cache.extend([dict(r) for r in app_rows])
-
-            logger.info(f"Loaded {len(_settings_cache)} settings and {len(_apps_cache)} apps from DB.")
-
-            # Start background config refresh
-            refresh_task = asyncio.create_task(_refresh_config())
-
-        except Exception as e:
-            logger.error(f"DB Connection Error: {e}")
     else:
         logger.warning("DATABASE_URL is not set. Logging to DB will be skipped.")
         # Fall back to env vars for settings
@@ -259,12 +226,14 @@ async def lifespan(app: FastAPI):
         _settings_cache["GLOBAL_TIMEOUT"] = _ENV_GLOBAL_TIMEOUT
         _settings_cache["MAX_RETRIES"] = _ENV_MAX_RETRIES
         _settings_cache["BASE_DELAY"] = _ENV_BASE_DELAY
+        _settings_cache["READ_TIMEOUT"] = _ENV_READ_TIMEOUT
+        _config_loaded = True
 
     yield  # App runs here
 
     # Cleanup on shutdown
-    if db_pool:
-        await db_pool.close()
+    if repo:
+        await repo.close()
     for c in _client_pool.values():
         await c.aclose()
     _client_pool.clear()
@@ -310,7 +279,7 @@ def normalize_tool_calls(raw_calls):
 
 async def process_log(log: dict):
     already_logged = log.get('logged', False)
-    if not (log.get("response") and log.get("request") and db_pool and (
+    if not (log.get("response") and log.get("request") and repo and (
             not already_logged)):
         return
 
@@ -343,53 +312,34 @@ async def process_log(log: dict):
                 raw_tools.append(block)
 
     try:
-        async with db_pool.acquire() as conn:
-            await conn.execute(
-                '''
-                INSERT INTO api_logs (
-                    url,
-                    method,
-                    query_params,
-                    request_headers,
-                    request_content_type,
-                    request_body_raw,
-                    request_body_json,
-                    response_status_code,
-                    response_headers,
-                    response_content_type,
-                    response_body_raw,
-                    response_body_json,
-                    final_text,
-                    final_reasoning_text,
-                    tool_calls,
-                    duration_sec,
-                    app_slug
-                ) VALUES ($1, $2, $3::jsonb, $4::jsonb, $5, $6, $7::jsonb, $8, $9::jsonb, $10, $11, $12::jsonb, $13, $14, $15::jsonb, $16, $17)
-                ''',
-                str(req.get("url")),
-                req.get("method"),
-                json.dumps(req.get("query_params")),
-                json.dumps(req.get("headers")),
-                req.get("headers", {}).get("content-type"),
-                req.get("raw_body"),
-                json.dumps(req.get("body")),
-                res.get("status_code"),
-                json.dumps(res.get("headers")),
-                res.get("content_type"),
-                res.get("raw_response"),
-                json.dumps(resp_data),
-                final_text,
-                final_reasoning,
-                json.dumps(normalize_tool_calls(raw_tools)),
-                res.get("duration_sec"),
-                app_slug
-            )
+        await repo.insert_log(
+            url=str(req.get("url")),
+            method=req.get("method"),
+            query_params=req.get("query_params"),
+            request_headers=req.get("headers"),
+            request_content_type=req.get("headers", {}).get("content-type"),
+            request_body_raw=req.get("raw_body"),
+            request_body=req.get("body"),
+            status_code=res.get("status_code"),
+            response_headers=res.get("headers"),
+            response_content_type=res.get("content_type"),
+            response_body_raw=res.get("raw_response"),
+            response_body=resp_data,
+            final_text=final_text,
+            final_reasoning=final_reasoning,
+            tool_calls=normalize_tool_calls(raw_tools),
+            duration_sec=res.get("duration_sec"),
+            app_slug=app_slug,
+        )
         log['logged'] = True
     except Exception as e:
-        logger.error(f"Postgres Insert Failed: {e}")
+        logger.error(f"DB Insert Failed: {e}")
 
 
-async def log_request_details(request: Request, body: bytes, store: dict):
+def build_request_store(request: Request, body: bytes, store: dict):
+    """Synchronously capture request details into `store`. Pure (no DB I/O) so
+    it can run once on the request path before the response is produced — the
+    actual insert happens later off the response path via process_log()."""
     raw_body = body.decode('utf-8', errors='replace')
     store["request"] = {
         "url": str(request.url),
@@ -400,7 +350,6 @@ async def log_request_details(request: Request, body: bytes, store: dict):
         "body": json.loads(raw_body) if "json" in request.headers.get(
             "content-type", "") else None
     }
-    await process_log(store)
 
 
 async def stream_ollama_response(
@@ -419,6 +368,9 @@ async def stream_ollama_response(
             yield chunk
 
         duration = time.time() - start_time
+        # httpx's aiter_bytes() already decodes Content-Encoding (gzip/deflate/
+        # br/zstd via the httpx[brotli,zstd] extras), so full_body holds the
+        # decoded SSE/NDJSON and the client receives it as identity.
         decoded = full_body.decode('utf-8', errors='replace')
 
         content_acc = []
@@ -558,8 +510,12 @@ async def stream_ollama_response(
                 "tool_calls": normalize_tool_calls(final_tools)
             }
         }
-        await process_log(store)
     finally:
+        # Single writer for the streaming path. store["request"] was captured
+        # synchronously in proxy() before streaming began, so this logs even if
+        # the client disconnects mid-stream. process_log() no-ops if there's no
+        # response yet (e.g. an early parse failure).
+        await process_log(store)
         await response.aclose()
 
 
@@ -568,6 +524,20 @@ async def proxy(request: Request, path: str):
     start_time = time.time()
     body = await request.body()
     req_store = {}
+
+    # Config not yet loaded (e.g. proxy started before Postgres on reboot).
+    # Return a clear, retryable 503 instead of forwarding with empty config.
+    if not _config_loaded:
+        return Response(
+            content="Proxy is starting up (configuration not yet loaded). Retry shortly.",
+            status_code=503,
+            headers={"Retry-After": "5"})
+
+    # Capture request details ONCE, synchronously, before any I/O. This is the
+    # single source of req_store["request"] for both stream and non-stream
+    # paths, so logging never races the response (the old code populated it in
+    # a BackgroundTask that could be dropped on client disconnect).
+    build_request_store(request, body, req_store)
 
     # Resolve target app
     app_slug, target_base_url, remaining_path = _resolve_app(path)
@@ -586,12 +556,17 @@ async def proxy(request: Request, path: str):
     # Get/create client for target
     target_client = _get_client(target_base_url)
 
-    # Header Preparation (Fixing DecodingError)
+    # Header Preparation.
+    #  - 'host': httpx sets the correct Host from the target base_url; forwarding
+    #    the inbound 'localhost:8080' breaks vhost routing / TLS SNI upstream.
+    #  - 'content-length': httpx recomputes it from `content=body`; forwarding a
+    #    stale value risks a mismatch.
+    # We deliberately KEEP the client's 'accept-encoding' so the upstream link
+    # may use compression (gzip/deflate/br/zstd). httpx transparently decodes it
+    # — via aiter_bytes() when streaming and .content when not — so we forward a
+    # decoded (identity) body to the client and strip the stale encoding headers.
     fwd_headers = {k: v for k, v in request.headers.items()
-                   if k.lower() not in [
-                       'host', 'content-length', 'accept-encoding']}
-    fwd_headers['accept-encoding'] = 'identity'
-    fwd_headers['connection'] = 'close'
+                   if k.lower() not in ('host', 'content-length')}
 
     try:
         # 1. Retry and Timeout Logic for the Initial Connection
@@ -634,17 +609,25 @@ async def proxy(request: Request, path: str):
                     (json.loads(body).get("stream") if body else False)
 
         if is_stream:
+            # The streaming generator's `finally` is the single log writer;
+            # req_store["request"] is already populated above.
             return StreamingResponse(
                 stream_ollama_response(response, start_time, req_store),
                 status_code=response.status_code,
                 media_type=response.headers.get("content-type"),
-                background=BackgroundTask(
-                    log_request_details, request, body, req_store)
             )
         else:
             # Wrap standard reading in a timeout
             await asyncio.wait_for(response.aread(), timeout=global_timeout)
             duration = time.time() - start_time
+
+            # httpx auto-decodes response.content (gzip/deflate/br/zstd when the
+            # relevant extras are installed). The outgoing headers must therefore
+            # NOT advertise the original Content-Encoding, and Content-Length must
+            # be recomputed — otherwise the client tries to re-decode plain bytes.
+            out_headers = {k: v for k, v in response.headers.items()
+                           if k.lower() not in ('content-encoding', 'content-length')}
+
             decoded_res = response.content.decode('utf-8', errors='replace')
             req_store["response"] = {
                 "status_code": response.status_code,
@@ -656,12 +639,13 @@ async def proxy(request: Request, path: str):
                     decoded_res) if "json" in response.headers.get(
                         "content-type", "") else {}
             }
-            await log_request_details(request, body, req_store)
-            await process_log(req_store)
+            # Defer the DB insert off the response path so the client isn't
+            # blocked on a write.
             return Response(
                 content=response.content,
                 status_code=response.status_code,
-                headers=dict(response.headers))
+                headers=out_headers,
+                background=BackgroundTask(process_log, req_store))
 
     except asyncio.TimeoutError:
         return Response(

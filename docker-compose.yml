@@ -2,7 +2,7 @@ version: '3.8'
 
 services:
   postgres:
-    image: postgres:15-alpine
+    image: postgres:15.10-alpine
     container_name: llm_obs_postgres
     restart: always
     environment:
@@ -20,30 +20,44 @@ services:
       retries: 5
 
   proxy:
-    build: ./proxy
+    build:
+      context: .
+      dockerfile: proxy/Dockerfile
     container_name: llm_obs_proxy
     restart: always
     ports:
       - "${PROXY_PORT:-8080}:8080"
     env_file: .env
     environment:
+      # DB_BACKEND=postgres (default) uses DATABASE_URL; set DB_BACKEND=sqlite
+      # to use the shared file at SQLITE_PATH instead (oi_data volume below).
+      - DB_BACKEND=${DB_BACKEND:-postgres}
       - DATABASE_URL=postgresql://admin:postgrespw@postgres:5432/tracing_db
+      - SQLITE_PATH=${SQLITE_PATH:-/data/openinspector.db}
+    volumes:
+      - oi_data:/data
     extra_hosts:
       - "host.docker.internal:host-gateway" # For the Linux localhost issue
     depends_on:
       postgres:
         condition: service_healthy
-    command: uvicorn main:app --host 0.0.0.0 --port 8080
+    command: uvicorn main:app --host 0.0.0.0 --port 8080 --workers ${UVICORN_WORKERS:-2}
 
   dashboard-api:
-    build: ./dashboard_api
+    build:
+      context: .
+      dockerfile: dashboard_api/Dockerfile
     container_name: llm_obs_api
     restart: always
     ports:
       - "8081:8081"
     env_file: .env
     environment:
+      - DB_BACKEND=${DB_BACKEND:-postgres}
       - DATABASE_URL=postgresql://admin:postgrespw@postgres:5432/tracing_db
+      - SQLITE_PATH=${SQLITE_PATH:-/data/openinspector.db}
+    volumes:
+      - oi_data:/data
     depends_on:
       postgres:
         condition: service_healthy
@@ -60,3 +74,4 @@ services:
 
 volumes:
   pg_data:
+  oi_data:
