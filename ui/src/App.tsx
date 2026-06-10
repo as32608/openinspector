@@ -80,6 +80,7 @@ export default function App() {
       setMetrics(data.summary);
     } catch (e) {
       console.error('Failed to load metrics', e);
+      toast.error('Failed to load metrics');
     }
   }, [appFilter]);
 
@@ -97,6 +98,7 @@ export default function App() {
       setTotalLogs(data.total);
     } catch (e) {
       console.error('Failed to load logs', e);
+      toast.error('Failed to load logs');
     }
   }, [page, debouncedSearch, viewMode, appFilter, errorFilterActive]);
 
@@ -106,6 +108,7 @@ export default function App() {
       setApps(data.apps);
     } catch (e) {
       console.error('Failed to load apps', e);
+      toast.error('Failed to load apps');
     }
   }, []);
 
@@ -129,9 +132,25 @@ export default function App() {
   useEffect(() => {
     if (liveMode) {
       liveIntervalRef.current = setInterval(() => {
+        // Skip polling while the tab is backgrounded — no point fetching data
+        // nobody is looking at, and it avoids needless DB load.
+        if (document.hidden) return;
         loadLogs();
         loadMetrics();
       }, 5000);
+
+      // Refresh immediately when the user returns to the tab.
+      const onVisible = () => {
+        if (!document.hidden) {
+          loadLogs();
+          loadMetrics();
+        }
+      };
+      document.addEventListener('visibilitychange', onVisible);
+      return () => {
+        document.removeEventListener('visibilitychange', onVisible);
+        if (liveIntervalRef.current) clearInterval(liveIntervalRef.current);
+      };
     } else {
       if (liveIntervalRef.current) {
         clearInterval(liveIntervalRef.current);

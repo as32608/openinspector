@@ -1,4 +1,6 @@
 venv
+.venv-test
+.pytest_cache
 *.ipynb
 *.json
 **__pycache__**

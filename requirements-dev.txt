@@ -1,0 +1,6 @@
+# Test-only dependencies (not installed in the service images).
+pytest==8.3.4
+pytest-asyncio==0.25.2
+aiosqlite==0.20.0
+# asyncpg is already in the service requirements; the Postgres smoke tests are
+# skipped automatically unless TEST_DATABASE_URL is set.

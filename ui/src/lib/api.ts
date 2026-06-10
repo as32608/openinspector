@@ -8,7 +8,32 @@ import type {
   AppConfig,
 } from '../types';
 
-const API_BASE = 'http://localhost:8081/api';
+// Relative path: the UI is served by nginx, which reverse-proxies /api to the
+// dashboard API on the same origin (see ui/nginx.conf). This avoids hardcoding
+// the host and removes the need for CORS.
+const API_BASE = '/api';
+
+// Parse a JSON response, throwing a descriptive error on non-2xx so callers'
+// catch blocks fire (and surface a toast) instead of silently consuming an
+// error body as data.
+async function jsonOrThrow<T>(res: Response, action: string): Promise<T> {
+  if (!res.ok) {
+    let detail = '';
+    try {
+      const body = await res.json();
+      detail = body?.detail ? `: ${body.detail}` : '';
+    } catch {
+      /* non-JSON error body */
+    }
+    throw new Error(`Failed to ${action} (HTTP ${res.status})${detail}`);
+  }
+  return res.json() as Promise<T>;
+}
+
+// Assert a mutation succeeded; for endpoints whose body we don't use.
+function assertOk(res: Response, action: string): void {
+  if (!res.ok) throw new Error(`Failed to ${action} (HTTP ${res.status})`);
+}
 
 // ============================================================
 // Metrics
@@ -18,7 +43,7 @@ export async function fetchMetrics(appFilter?: string): Promise<MetricsResponse>
   const params = new URLSearchParams();
   if (appFilter) params.set('app', appFilter);
   const res = await fetch(`${API_BASE}/metrics?${params}`);
-  return res.json();
+  return jsonOrThrow(res, 'load metrics');
 }
 
 // ============================================================
@@ -41,21 +66,22 @@ export async function fetchLogs(opts: {
   if (opts.app) params.set('app', opts.app);
   if (opts.status) params.set('status', opts.status);
   const res = await fetch(`${API_BASE}/logs?${params}`);
-  return res.json();
+  return jsonOrThrow(res, 'load logs');
 }
 
 export async function fetchTrace(logId: number): Promise<TraceResponse> {
   const res = await fetch(`${API_BASE}/traces/${logId}`);
-  return res.json();
+  return jsonOrThrow(res, 'load trace');
 }
 
 export async function fetchRawLog(logId: number): Promise<RawLogData> {
   const res = await fetch(`${API_BASE}/logs/${logId}/raw`);
-  return res.json();
+  return jsonOrThrow(res, 'load raw data');
 }
 
 export async function deleteLog(logId: number): Promise<void> {
-  await fetch(`${API_BASE}/logs/${logId}`, { method: 'DELETE' });
+  const res = await fetch(`${API_BASE}/logs/${logId}`, { method: 'DELETE' });
+  assertOk(res, 'delete log');
 }
 
 export async function bulkDeleteLogs(ids: number[]): Promise<{ count: number }> {
@@ -64,7 +90,7 @@ export async function bulkDeleteLogs(ids: number[]): Promise<{ count: number }> 
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ ids }),
   });
-  return res.json();
+  return jsonOrThrow(res, 'delete logs');
 }
 
 // ============================================================
@@ -73,15 +99,16 @@ export async function bulkDeleteLogs(ids: number[]): Promise<{ count: number }> 
 
 export async function fetchSettings(): Promise<SettingsResponse> {
   const res = await fetch(`${API_BASE}/settings`);
-  return res.json();
+  return jsonOrThrow(res, 'load settings');
 }
 
 export async function updateSettings(settings: Record<string, string>): Promise<void> {
-  await fetch(`${API_BASE}/settings`, {
+  const res = await fetch(`${API_BASE}/settings`, {
     method: 'PUT',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ settings }),
   });
+  assertOk(res, 'update settings');
 }
 
 // ============================================================
@@ -90,7 +117,7 @@ export async function updateSettings(settings: Record<string, string>): Promise<
 
 export async function fetchApps(): Promise<AppsResponse> {
   const res = await fetch(`${API_BASE}/apps`);
-  return res.json();
+  return jsonOrThrow(res, 'load apps');
 }
 
 export async function createApp(app: Omit<AppConfig, 'id' | 'created_at'>): Promise<AppConfig> {
@@ -99,11 +126,7 @@ export async function createApp(app: Omit<AppConfig, 'id' | 'created_at'>): Prom
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(app),
   });
-  if (!res.ok) {
-    const err = await res.json();
-    throw new Error(err.detail || 'Failed to create app');
-  }
-  return res.json();
+  return jsonOrThrow(res, 'create app');
 }
 
 export async function updateApp(
@@ -115,11 +138,12 @@ export async function updateApp(
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(updates),
   });
-  return res.json();
+  return jsonOrThrow(res, 'update app');
 }
 
 export async function deleteApp(appId: number): Promise<void> {
-  await fetch(`${API_BASE}/apps/${appId}`, { method: 'DELETE' });
+  const res = await fetch(`${API_BASE}/apps/${appId}`, { method: 'DELETE' });
+  assertOk(res, 'delete app');
 }
 
 // ============================================================
